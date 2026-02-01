@@ -1,7 +1,20 @@
+# Core app
 streamlit==1.52.2
-pandas==2.3.3
-numpy==2.3.5
-matplotlib==3.10.7
-mne==1.11.0
-scipy==1.16.3
+
+# Data stack
+numpy==1.26.4
+pandas==2.2.3
 openpyxl==3.1.5
+
+# Plotting
+matplotlib==3.8.4
+altair==5.3.0
+
+# EEG / neuroscience
+mne==1.6.1
+
+# Google Drive API
+google-api-python-client==2.125.0
+google-auth==2.29.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0

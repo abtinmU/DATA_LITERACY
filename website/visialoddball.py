@@ -1,23 +1,38 @@
 """
-Unified Streamlit dashboard for the COCOA project.
+COCOA Unified Streamlit Dashboard (Streamlit Cloud-ready)
 
-Features:
-- Pre-ICA extreme-loss exploration (Excel)
-- Visual Oddball QC workflow (EEGLAB .set files) if present
-- Demographic filters (Age, Gender, Income, etc.) applied FIRST to determine eligible participants
-- Participant selection is optional: if empty, use all eligible participants
-- Uses tueplots if available (optional). Falls back gracefully if not installed.
+✅ Pre-ICA metrics view:
+- Uses local files if present next to this script:
+    - COCOA_preICAextremeloss.xlsx
+    - participants.tsv
+- If the Excel is NOT local, it can optionally fetch it from Google Drive
+  (from the same Drive folder configured by secrets) by filename.
 
-Cloud-safe:
-- Uses paths relative to this file (Path(__file__).parent) instead of os.getcwd()
+✅ Visual Oddball QC view (Drive-backed):
+- Reads EEGLAB .set + .fdt files from Google Drive (on-demand download)
+- Caches downloaded files under /tmp/cocoa_cache so reruns are fast
+- Works with your folder-stage naming: 01_raw, 02_preprocessed, ... 08_AR
+
+🔐 Requirements:
+- Put the service account JSON in Streamlit Cloud Secrets (NOT in code)
+- Secrets must include:
+    GDRIVE_VO_FOLDER_ID = "..."
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "..."
+    client_id = "..."
+    token_uri = "https://oauth2.googleapis.com/token"
 """
 
 from __future__ import annotations
 
+import io
 import re
-import glob
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -25,128 +40,209 @@ import numpy as np
 import altair as alt
 import matplotlib.pyplot as plt
 
-# Optional MNE for EEGLAB support
+# Optional MNE (needed for .set files)
 try:
     import mne  # noqa: F401
 except Exception:
     mne = None
 
-# Optional tueplots for style bundles
-try:
-    from tueplots import bundles  # type: ignore
-    TUEPLOTS_AVAILABLE = True
-except Exception:
-    bundles = None
-    TUEPLOTS_AVAILABLE = False
+# Google Drive API (required for VO view)
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 
-###############################################################################
-# Paths (cloud-safe)
-###############################################################################
-
+# -----------------------------
+# Local paths (repo)
+# -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
+LOCAL_PREICA_XLSX = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
+LOCAL_PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"
 
-PREICA_XLSX = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
-PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"
-VO_PROJECT = BASE_DIR / "Preprocessed_VisualOddball"  # from your screenshot
+# Cache folder on Streamlit Cloud
+CACHE_ROOT = Path("/tmp/cocoa_cache")
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-###############################################################################
-# Palette
-###############################################################################
-
+# -----------------------------
+# Palette / style
+# -----------------------------
 TUE_PALETTE = [
-    "#006AA3",  # blue
-    "#E65C00",  # orange
-    "#A31C34",  # red
-    "#5C8021",  # green
-    "#735545",  # brown
-    "#4A6D8C",  # dark blue
+    "#006AA3",
+    "#E65C00",
+    "#A31C34",
+    "#5C8021",
+    "#735545",
+    "#4A6D8C",
 ]
 
-
-###############################################################################
-# Filters config (same idea as your unified file)
-###############################################################################
-
-FILTER_CONFIG = {
-    "Age": {"type": "range", "min": 18, "max": 80, "step": 1},
-    "Household_Members": {"type": "range", "min": 1, "max": 10, "step": 1},
-    "Gender": {"type": "multiselect", "options": ["female", "male", "other"]},
-    "Handedness": {"type": "multiselect", "options": ["right", "left", "ambidextrous"]},
-    "Highest_Edu": {"type": "multiselect", "options": []},   # will be derived if present
-    "Occupation": {"type": "multiselect", "options": []},    # will be derived if present
-    "Employed": {"type": "multiselect", "options": ["yes", "no"]},
-    "Employed_Yes": {"type": "multiselect", "options": []},  # derived if present
-    "Income": {"type": "multiselect", "options": []},        # derived if present
-    "Project": {"type": "multiselect", "options": []},       # derived if present
-    "EEG_Tasks": {"type": "multiselect", "options": []},     # derived if present
-    "fs1": {"type": "multiselect", "options": []},           # derived if present
-}
-
-META_COL_ALIASES: Dict[str, List[str]] = {
-    "participant_id": ["participant_id", "subject_id", "sub_id", "id", "participant", "subject"],
-    "Age": ["age", "Age"],
-    "Household_Members": ["household_members", "householdmembers", "household_members_count", "household_members"],
-    "Gender": ["gender", "sex"],
-    "Handedness": ["handedness"],
-    "Highest_Edu": ["highest_edu", "highest_education", "education", "edu"],
-    "Occupation": ["occupation"],
-    "Employed": ["employed"],
-    "Employed_Yes": ["employed_yes", "employment_type"],
-    "Income": ["income", "household_income", "income_range"],
-    "Project": ["project"],
-    "EEG_Tasks": ["eeg_tasks", "eeg_task", "tasks"],
-    "fs1": ["fs1"],
-}
-
-
-def _find_first_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    cols_lower = {c.lower(): c for c in df.columns}
-    for a in aliases:
-        if a.lower() in cols_lower:
-            return cols_lower[a.lower()]
-    return None
-
-
-###############################################################################
-# Plot style
-###############################################################################
 
 def apply_plot_style() -> None:
     if st.session_state.get("_plot_style_applied"):
         return
-
-    if TUEPLOTS_AVAILABLE:
-        plt.rcParams.update(bundles.icml2024(column="full", nrows=1, ncols=1))
-    else:
-        plt.rcParams.update(
-            {
-                "figure.dpi": 120,
-                "savefig.dpi": 300,
-                "axes.grid": True,
-                "grid.alpha": 0.25,
-                "grid.linestyle": "--",
-                "axes.spines.top": False,
-                "axes.spines.right": False,
-                "axes.labelsize": 11,
-                "axes.titlesize": 12,
-                "legend.fontsize": 10,
-                "xtick.labelsize": 10,
-                "ytick.labelsize": 10,
-                "lines.linewidth": 1.4,
-            }
-        )
-
+    plt.rcParams.update(
+        {
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "grid.linestyle": "--",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 11,
+            "axes.titlesize": 12,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "lines.linewidth": 1.4,
+        }
+    )
     st.session_state["_plot_style_applied"] = True
 
 
-###############################################################################
-# Loaders
-###############################################################################
+# ============================================================
+# 0) Drive smoke test (quick verification)
+# ============================================================
+def drive_smoke_test() -> None:
+    """Fail fast if secrets / access are wrong."""
+    try:
+        folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
+        _ = st.secrets["gcp_service_account"]["client_email"]
+
+        creds_info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        resp = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id,name,mimeType)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        items = resp.get("files", [])
+        if not items:
+            st.warning("Drive API works, but the folder seems empty OR not shared with the service account.")
+        else:
+            st.success("✅ Drive API access confirmed.")
+    except Exception as e:
+        st.error("❌ Drive access test failed. Check secrets + folder sharing.")
+        st.exception(e)
+        st.stop()
+
+
+# ============================================================
+# 1) Google Drive indexing + downloading
+# ============================================================
+def _drive_service():
+    creds_info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
 
 @st.cache_data(show_spinner=False)
-def load_preica_data(path: str) -> pd.DataFrame:
+def drive_index_recursive(folder_id: str) -> List[Dict]:
+    """
+    Recursively index ALL files under Drive folder_id.
+    Returns list of dicts: {id, name, mimeType}
+    """
+    svc = _drive_service()
+    out: List[Dict] = []
+    queue = [folder_id]
+
+    while queue:
+        fid = queue.pop()
+        page_token = None
+        while True:
+            resp = svc.files().list(
+                q=f"'{fid}' in parents and trashed=false",
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageToken=page_token,
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            for f in resp.get("files", []):
+                if f["mimeType"] == "application/vnd.google-apps.folder":
+                    queue.append(f["id"])
+                else:
+                    out.append(f)
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    return out
+
+
+def participants_from_index(files: List[Dict]) -> List[str]:
+    ids = set()
+    for f in files:
+        m = re.search(r"(sub-\d+)", f["name"])
+        if m:
+            ids.add(m.group(1))
+    return sorted(ids)
+
+
+def _download(file_id: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    svc = _drive_service()
+    request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+
+    with io.FileIO(dest, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+    return dest
+
+
+def _find_by_name(files: List[Dict], name: str) -> Optional[Dict]:
+    return next((f for f in files if f["name"] == name), None)
+
+
+def find_first_match(files: List[Dict], *, contains: str, endswith: str) -> Optional[Dict]:
+    hits = [f for f in files if contains in f["name"] and f["name"].endswith(endswith)]
+    hits.sort(key=lambda x: x["name"])
+    return hits[0] if hits else None
+
+
+def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path:
+    """
+    Download .set and (if present) matching .fdt into the same folder.
+    Returns local path to the .set file.
+    """
+    set_name = set_file["name"]
+    local_set = CACHE_ROOT / stage / set_name
+    _download(set_file["id"], local_set)
+
+    if set_name.lower().endswith(".set"):
+        fdt_name = set_name[:-4] + ".fdt"
+        fdt_file = _find_by_name(files, fdt_name)
+        if fdt_file:
+            local_fdt = CACHE_ROOT / stage / fdt_name
+            _download(fdt_file["id"], local_fdt)
+
+    return local_set
+
+
+# ============================================================
+# 2) Pre-ICA (Excel) helpers
+# ============================================================
+@st.cache_data(show_spinner=False)
+def load_preica_data_from_excel(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
     df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
     df["task"] = df["ID"].astype(str).str.extract(r"task-([^_]+)")
@@ -159,133 +255,6 @@ def load_preica_data(path: str) -> pd.DataFrame:
 def get_preica_channels(df: pd.DataFrame) -> List[str]:
     return [c for c in df.columns if c not in ["ID", "participant", "task"]]
 
-
-@st.cache_data(show_spinner=False)
-def load_participants_metadata(tsv_path: str) -> Optional[pd.DataFrame]:
-    if not Path(tsv_path).is_file():
-        return None
-    try:
-        return pd.read_csv(tsv_path, sep="\t")
-    except Exception:
-        return None
-
-
-###############################################################################
-# Demographic filtering
-###############################################################################
-
-def _derive_options_if_possible(meta: pd.DataFrame, field: str) -> List[str]:
-    col = _find_first_col(meta, META_COL_ALIASES.get(field, [field]))
-    if not col:
-        return []
-    vals = (
-        meta[col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .replace("", np.nan)
-        .dropna()
-        .unique()
-        .tolist()
-    )
-    # Keep it tidy
-    vals_sorted = sorted(vals, key=lambda x: x.lower())
-    # Avoid insane lists
-    return vals_sorted[:200]
-
-
-def apply_demographic_filters_to_meta(df_meta: pd.DataFrame, selections: dict) -> pd.DataFrame:
-    out = df_meta.copy()
-
-    # Age range
-    age_sel = selections.get("Age")
-    if age_sel:
-        col = _find_first_col(out, META_COL_ALIASES["Age"])
-        if col:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-            a_min, a_max = age_sel
-            out = out[(out[col] >= a_min) & (out[col] <= a_max)]
-
-    # Household members range
-    hh_sel = selections.get("Household_Members")
-    if hh_sel:
-        col = _find_first_col(out, META_COL_ALIASES["Household_Members"])
-        if col:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-            h_min, h_max = hh_sel
-            out = out[(out[col] >= h_min) & (out[col] <= h_max)]
-
-    # Categorical
-    categorical_fields = [
-        "Gender", "Handedness", "Highest_Edu", "Occupation",
-        "Employed", "Employed_Yes", "Income", "Project", "EEG_Tasks", "fs1",
-    ]
-    for field in categorical_fields:
-        chosen = selections.get(field) or []
-        if not chosen:
-            continue
-        col = _find_first_col(out, META_COL_ALIASES.get(field, [field]))
-        if not col:
-            continue
-        series = out[col].astype(str).str.strip().str.lower()
-        allowed = {str(x).strip().lower() for x in chosen}
-        out = out[series.isin(allowed)]
-
-    return out
-
-
-def meta_participant_ids(df_meta: pd.DataFrame) -> List[str]:
-    col = _find_first_col(df_meta, META_COL_ALIASES["participant_id"])
-    if not col:
-        return []
-    return sorted(df_meta[col].astype(str).str.strip().unique().tolist())
-
-
-def generate_filter_widgets(meta: Optional[pd.DataFrame], selections: dict, *, prefix: str) -> None:
-    # Range sliders
-    selections["Age"] = st.slider(
-        "Age range",
-        min_value=FILTER_CONFIG["Age"]["min"],
-        max_value=FILTER_CONFIG["Age"]["max"],
-        value=(FILTER_CONFIG["Age"]["min"], FILTER_CONFIG["Age"]["max"]),
-        step=FILTER_CONFIG["Age"]["step"],
-        key=f"{prefix}_age",
-    )
-    selections["Household_Members"] = st.slider(
-        "Household members range",
-        min_value=FILTER_CONFIG["Household_Members"]["min"],
-        max_value=FILTER_CONFIG["Household_Members"]["max"],
-        value=(FILTER_CONFIG["Household_Members"]["min"], FILTER_CONFIG["Household_Members"]["max"]),
-        step=FILTER_CONFIG["Household_Members"]["step"],
-        key=f"{prefix}_hh",
-    )
-
-    # Categorical filters
-    cat_fields = ["Gender", "Handedness", "Highest_Edu", "Occupation", "Employed", "Employed_Yes",
-                  "Income", "Project", "EEG_Tasks", "fs1"]
-
-    for field in cat_fields:
-        options = FILTER_CONFIG[field].get("options") or []
-        if meta is not None and not options:
-            # derive from metadata if possible
-            options = _derive_options_if_possible(meta, field)
-
-        # keep Gender/Handedness defaults if metadata missing
-        if not options and FILTER_CONFIG[field].get("options"):
-            options = FILTER_CONFIG[field]["options"]
-
-        selections[field] = st.multiselect(
-            field,
-            options=options,
-            default=[],
-            key=f"{prefix}_{field}",
-            placeholder="Search and select...",
-        )
-
-
-###############################################################################
-# Pre-ICA plotting
-###############################################################################
 
 def plot_preica_line(df: pd.DataFrame, channels: List[str]) -> alt.Chart:
     long_df = df.melt(id_vars=["participant"], value_vars=channels, var_name="channel", value_name="value")
@@ -315,7 +284,7 @@ def plot_preica_histograms(df: pd.DataFrame, channels: List[str]) -> None:
         color = TUE_PALETTE[i % len(TUE_PALETTE)]
         data = df[ch].dropna()
         ax.hist(data, bins=20, color=color, edgecolor="black")
-        ax.set_title(f"{ch}")
+        ax.set_title(ch)
         ax.set_xlabel("Pre-ICA extreme loss")
         ax.set_ylabel("Count")
         ax.set_ylim(bottom=0)
@@ -340,34 +309,12 @@ def plot_preica_boxplot(df: pd.DataFrame, channels: List[str]) -> None:
     plt.close(fig)
 
 
-###############################################################################
-# Visual Oddball QC helpers (optional)
-###############################################################################
-
-def list_vo_participants(project_dir: Path) -> List[str]:
-    if not project_dir.is_dir():
-        return []
-    files = project_dir.rglob("*.set")
-    ids = set()
-    for f in files:
-        m = re.search(r"(sub-\d+)", f.name)
-        if m:
-            ids.add(m.group(1))
-    return sorted(ids)
-
-
-def find_vo_file(folder: str, pattern: str, participant_id: str) -> Optional[str]:
-    d = VO_PROJECT / folder
-    if not d.is_dir():
-        return None
-    # pattern example: "*raw.set" => we just use it as suffix-ish
-    hits = sorted(glob.glob(str(d / f"{participant_id}*{pattern.replace('*','')}")))
-    return hits[0] if hits else None
-
-
+# ============================================================
+# 3) VO QC helpers (MNE)
+# ============================================================
 @st.cache_data(show_spinner=False)
-def load_raw(path: str):
-    if mne is None or not path or not Path(path).exists():
+def load_raw_eeglab(path: str):
+    if mne is None:
         return None
     try:
         return mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
@@ -376,8 +323,8 @@ def load_raw(path: str):
 
 
 @st.cache_data(show_spinner=False)
-def load_epochs(path: str):
-    if mne is None or not path or not Path(path).exists():
+def load_epochs_eeglab(path: str):
+    if mne is None:
         return None
     try:
         return mne.io.read_epochs_eeglab(path, verbose="ERROR")
@@ -413,12 +360,9 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
         psd_pre_db = 10 * np.log10(spec_pre.get_data().squeeze())
     except Exception:
         from mne.time_frequency import psd_welch
-        psd_raw, freqs = psd_welch(raw_obj, fmin=0.5, fmax=45.0,
-                                   picks=[channel] if channel in raw_obj.ch_names else None,
-                                   verbose="ERROR")
-        psd_pre, _ = psd_welch(preproc_obj, fmin=0.5, fmax=45.0,
-                               picks=[channel] if channel in preproc_obj.ch_names else None,
-                               verbose="ERROR")
+
+        psd_raw, freqs = psd_welch(raw_obj, fmin=0.5, fmax=45.0, picks=[channel] if channel in raw_obj.ch_names else None, verbose="ERROR")
+        psd_pre, _ = psd_welch(preproc_obj, fmin=0.5, fmax=45.0, picks=[channel] if channel in preproc_obj.ch_names else None, verbose="ERROR")
         psd_raw_db = 10 * np.log10(psd_raw.squeeze())
         psd_pre_db = 10 * np.log10(psd_pre.squeeze())
 
@@ -432,102 +376,43 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     plt.close(fig)
 
 
-def qc_workflow(participant_id: str) -> None:
-    st.markdown(f"### Participant: {participant_id}")
-
-    st.subheader("1) Raw continuous data")
-    raw_path = find_vo_file("01_raw", "*raw.set", participant_id)
-    if raw_path:
-        raw = load_raw(raw_path)
-        if raw is not None:
-            plot_segment(raw, "Raw EEG segment", "Pz", 5.0)
-        else:
-            st.error("Failed to load raw file.")
-    else:
-        st.warning("Raw file not found.")
-
-    st.subheader("2) Preprocessed data + PSD overlay")
-    pre_path = find_vo_file("02_preprocessed", "*preprocessed.set", participant_id)
-    if pre_path:
-        pre = load_raw(pre_path)
-        if pre is not None:
-            plot_segment(pre, "Preprocessed segment", "Pz", 5.0)
-            if raw_path and raw is not None:
-                plot_psd_overlay(raw, pre, "Pz")
-        else:
-            st.error("Failed to load preprocessed file.")
-    else:
-        st.warning("Preprocessed file not found.")
-
-    st.subheader("3) Epoched data & ERP (if available)")
-    ep_path = find_vo_file("08_AR", "*autoAR.set", participant_id) or find_vo_file("07_epoched", "*epoched.set", participant_id)
-    if ep_path:
-        epochs = load_epochs(ep_path)
-        if epochs is not None:
-            keys = list(epochs.event_id.keys())
-            target = keys[0]
-            try:
-                evk = epochs[target].average()
-                fig = evk.plot(picks="Pz" if "Pz" in evk.ch_names else None, show=False)
-                st.pyplot(fig)
-                plt.close(fig)
-            except Exception as e:
-                st.error(f"Could not plot ERP: {e}")
-        else:
-            st.error("Failed to load epochs file.")
-    else:
-        st.warning("Epoched file not found.")
-
-    st.markdown("---")
-
-
-###############################################################################
-# Views
-###############################################################################
-
-def preica_view() -> None:
+# ============================================================
+# 4) Views
+# ============================================================
+def preica_view(files_index: Optional[List[Dict]] = None) -> None:
     st.header("Pre-ICA extreme-loss exploration")
 
-    if not PREICA_XLSX.exists():
-        st.error(f"Missing file: {PREICA_XLSX.name} (expected next to this script).")
-        st.stop()
+    # Use local Excel if present; otherwise optionally fetch from Drive by name.
+    excel_path = None
 
-    df_preica = load_preica_data(str(PREICA_XLSX))
-    channels = get_preica_channels(df_preica)
-
-    meta = load_participants_metadata(str(PARTICIPANTS_TSV))
-
-    st.sidebar.header("Demographic filters (apply first)")
-    filter_selections: dict = {}
-    generate_filter_widgets(meta, filter_selections, prefix="demo")
-
-    # Eligible list comes from metadata, then intersect with Excel participants
-    all_from_xlsx = sorted(df_preica["participant"].dropna().unique().tolist())
-
-    if meta is not None:
-        filtered_meta = apply_demographic_filters_to_meta(meta, filter_selections)
-        eligible = meta_participant_ids(filtered_meta)
-        eligible = [p for p in eligible if p in all_from_xlsx]
+    if LOCAL_PREICA_XLSX.exists():
+        excel_path = str(LOCAL_PREICA_XLSX)
+        st.caption("Using local COCOA_preICAextremeloss.xlsx")
     else:
-        eligible = all_from_xlsx
-        st.sidebar.warning("participants.tsv not found → demographic filters cannot be applied (showing all participants).")
+        # Optional Drive fetch (if user didn't put Excel in repo)
+        if files_index is not None:
+            xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
+            if xlsx:
+                local = CACHE_ROOT / "preica" / xlsx["name"]
+                _download(xlsx["id"], local)
+                excel_path = str(local)
+                st.caption("Using Drive COCOA_preICAextremeloss.xlsx (downloaded to cache)")
+        if excel_path is None:
+            st.error("Pre-ICA Excel not found locally and not found on Drive.")
+            st.stop()
 
-    if not eligible:
-        st.warning("No participants match the current demographic filters.")
-        return
+    df = load_preica_data_from_excel(excel_path)
+    channels = get_preica_channels(df)
+    participants = sorted(df["participant"].dropna().unique().tolist())
 
-    st.sidebar.markdown("---")
-    prev_selected = st.session_state.get("preica_selected_participants", [])
-    pruned_default = [p for p in prev_selected if p in eligible]
-
+    st.sidebar.subheader("Pre-ICA controls")
     selected_participants = st.sidebar.multiselect(
         "Participants (optional)",
-        options=eligible,
-        default=pruned_default,
-        key="preica_selected_participants",
-        placeholder="Leave empty = use all eligible participants",
+        options=participants,
+        default=[],
+        placeholder="Leave empty = all participants",
+        key="preica_participants",
     )
-
     default_channels = channels[:3] if channels else []
     selected_channels = st.sidebar.multiselect(
         "EEG channels",
@@ -535,36 +420,28 @@ def preica_view() -> None:
         default=default_channels,
         key="preica_channels",
     )
+    plot_type = st.sidebar.radio("Plot type", ["Line chart", "Histogram", "Boxplot"], key="preica_plot")
+    run = st.sidebar.button("Generate analysis", type="primary", key="preica_run")
 
-    plot_type = st.sidebar.radio(
-        "Plot type",
-        options=["Line chart", "Histogram", "Boxplot"],
-        key="preica_plot_type",
-    )
-
-    generate = st.sidebar.button("Generate analysis", type="primary", key="preica_generate")
-
-    if not generate:
-        st.info("Set demographic filters first. Then click **Generate analysis**.")
+    if not run:
+        st.info("Select channels and click **Generate analysis**.")
         return
 
     if not selected_channels:
         st.warning("Select at least one EEG channel.")
         return
 
-    # If user did NOT select participants, use ALL eligible
-    active_participants = selected_participants if selected_participants else eligible
-    filtered_df = df_preica[df_preica["participant"].isin(active_participants)].copy()
+    active = selected_participants if selected_participants else participants
+    fdf = df[df["participant"].isin(active)].copy()
 
     st.subheader("Summary")
-    st.write(f"Eligible participants (after demographic filters): {len(eligible)}")
-    st.write(f"Used participants: {len(active_participants)}")
-    st.write(f"Records: {len(filtered_df)}")
+    st.write(f"Participants used: {len(active)}")
+    st.write(f"Records: {len(fdf)}")
 
-    stats_rows = []
+    stats = []
     for ch in selected_channels:
-        vals = filtered_df[ch].dropna()
-        stats_rows.append(
+        vals = fdf[ch].dropna()
+        stats.append(
             {
                 "channel": ch,
                 "mean": float(vals.mean()) if len(vals) else np.nan,
@@ -573,74 +450,185 @@ def preica_view() -> None:
                 "max": float(vals.max()) if len(vals) else np.nan,
             }
         )
-    st.dataframe(pd.DataFrame(stats_rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(stats), use_container_width=True)
 
     st.subheader("Visualisation")
     if plot_type == "Line chart":
-        st.altair_chart(plot_preica_line(filtered_df, selected_channels), use_container_width=True)
+        st.altair_chart(plot_preica_line(fdf, selected_channels), use_container_width=True)
     elif plot_type == "Histogram":
-        plot_preica_histograms(filtered_df, selected_channels)
+        plot_preica_histograms(fdf, selected_channels)
     else:
-        plot_preica_boxplot(filtered_df, selected_channels)
-
-    if not TUEPLOTS_AVAILABLE:
-        st.caption("Note: `tueplots` not installed → using fallback Matplotlib styling.")
+        plot_preica_boxplot(fdf, selected_channels)
 
 
-def vo_qc_view() -> None:
-    st.header("Visual Oddball QC workflow")
+def vo_qc_view(files_index: List[Dict]) -> None:
+    st.header("Visual Oddball QC (Google Drive)")
 
     if mne is None:
-        st.error("MNE is not available. Add `mne` to requirements.txt to enable QC plots.")
+        st.error("MNE is not available. Add `mne` to requirements.txt.")
         return
 
-    if not VO_PROJECT.is_dir():
-        st.warning(f"No folder found: {VO_PROJECT.name} (expected next to this script).")
-        return
-
-    participants = list_vo_participants(VO_PROJECT)
+    participants = participants_from_index(files_index)
     if not participants:
-        st.warning("No .set files found under Preprocessed_VisualOddball/.")
+        st.warning("No participant files found in the Drive folder.")
         return
 
-    st.sidebar.header("Visual Oddball QC")
-    selected_ids = st.sidebar.multiselect(
-        "Participants",
-        options=participants,
-        default=participants[:1],
-        key="vo_participants",
-    )
-    run_button = st.sidebar.button("Run QC workflow", type="primary", key="vo_run")
+    st.sidebar.subheader("VO QC controls")
+    pid = st.sidebar.selectbox("Participant", participants, index=0, key="vo_pid")
+    run = st.sidebar.button("Run QC", type="primary", key="vo_run")
 
-    if not run_button:
-        st.info("Select participants and click **Run QC workflow**.")
+    if not run:
+        st.info("Pick a participant and click **Run QC**.")
         return
 
-    for p in selected_ids:
-        qc_workflow(p)
+    # Your stages and suffix patterns (based on your screenshot)
+    stages: List[Tuple[str, str]] = [
+        ("01_raw", "_eeg_raw.set"),
+        ("02_preprocessed", "_eeg_preprocessed.set"),
+        ("03_preICA", "_eeg_preICA.set"),
+        ("04_ICAweighted", "_eegICA_weighted.set"),
+        ("06_postICA", "_eegpostICA.set"),
+        ("06_postICApracticeremoved", "_eegpostICA_practiceremoved.set"),
+        ("07_epoched", "_epoched.set"),
+        # 08_AR varies; we match contains "autoAR" endswith .set
+    ]
 
-    if not TUEPLOTS_AVAILABLE:
-        st.caption("Note: `tueplots` not installed → using fallback Matplotlib styling.")
+    st.markdown(f"### Participant: `{pid}`")
+
+    # 1) Raw
+    st.subheader("1) Raw continuous data")
+    raw_set = find_first_match(files_index, contains=pid, endswith=stages[0][1])
+    raw_obj = None
+    if raw_set:
+        raw_path = download_set_and_pair(files_index, raw_set, "01_raw")
+        raw_obj = load_raw_eeglab(str(raw_path))
+        if raw_obj is not None:
+            plot_segment(raw_obj, "Raw EEG segment", "Pz", 5.0)
+        else:
+            st.error("Failed to load raw .set")
+    else:
+        st.warning("Raw .set not found.")
+
+    # 2) Preprocessed + PSD overlay
+    st.subheader("2) Preprocessed data and PSD overlay")
+    pre_set = find_first_match(files_index, contains=pid, endswith=stages[1][1])
+    if pre_set:
+        pre_path = download_set_and_pair(files_index, pre_set, "02_preprocessed")
+        pre_obj = load_raw_eeglab(str(pre_path))
+        if pre_obj is not None:
+            plot_segment(pre_obj, "Preprocessed segment", "Pz", 5.0)
+            if raw_obj is not None:
+                plot_psd_overlay(raw_obj, pre_obj, "Pz")
+        else:
+            st.error("Failed to load preprocessed .set")
+    else:
+        st.warning("Preprocessed .set not found.")
+
+    # 3) Pre-ICA (Excel + optional per-subject set)
+    st.subheader("3) Pre-ICA extreme-loss table (if available)")
+    preica_xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
+    if preica_xlsx:
+        local_xlsx = CACHE_ROOT / "03_preICA" / preica_xlsx["name"]
+        _download(preica_xlsx["id"], local_xlsx)
+        df_loss = pd.read_excel(local_xlsx)
+        if "ID" in df_loss.columns:
+            subj = df_loss[df_loss["ID"].astype(str).str.contains(pid)]
+            if not subj.empty:
+                ch_cols = [c for c in subj.columns if c not in ["ID"]]
+                vals = subj[ch_cols].values.flatten().astype(float)
+                apply_plot_style()
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.bar(range(len(ch_cols)), vals, color=TUE_PALETTE[3])
+                ax.set_xticks(range(len(ch_cols)))
+                ax.set_xticklabels(ch_cols, rotation=90)
+                ax.set_ylabel("% extreme artifact")
+                ax.set_title("Pre-ICA extreme-loss per channel (from table)")
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.info("No loss data for this participant in the Excel table.")
+        else:
+            st.warning("Excel table missing 'ID' column.")
+    else:
+        st.info("COCOA_preICAextremeloss.xlsx not found in Drive folder.")
+
+    # 4) ICLabel file (xlsx)
+    st.subheader("4) ICLabel classification (xlsx, if available)")
+    ic_xlsx = find_first_match(files_index, contains=pid, endswith="_ICclassifications.xlsx")
+    if ic_xlsx:
+        local_ic = CACHE_ROOT / "05_ICLabel" / ic_xlsx["name"]
+        _download(ic_xlsx["id"], local_ic)
+        ic_df = pd.read_excel(local_ic)
+
+        cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
+        if set(cols).issubset(ic_df.columns):
+            apply_plot_style()
+            mean_probs = ic_df[cols].mean()
+            fig, ax = plt.subplots()
+            mean_probs.plot(kind="bar", ax=ax, color=[TUE_PALETTE[i % len(TUE_PALETTE)] for i in range(len(cols))])
+            ax.set_ylabel("Mean probability (%)")
+            ax.set_title("Mean ICLabel class probabilities")
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.warning("ICLabel file found, but required columns are missing.")
+            st.write("Columns:", list(ic_df.columns))
+    else:
+        st.info("ICLabel xlsx not found for this participant.")
+
+    # 5) Epoched/AR ERP (optional)
+    st.subheader("5) Epoched data & ERP (if available)")
+    # Try autoAR first (contains "autoAR", endswith .set)
+    ar_hits = [f for f in files_index if pid in f["name"] and "autoAR" in f["name"] and f["name"].endswith(".set")]
+    ar_hits.sort(key=lambda x: x["name"])
+    ar_set = ar_hits[0] if ar_hits else None
+
+    ep_set = find_first_match(files_index, contains=pid, endswith="_epoched.set")
+
+    chosen = ar_set or ep_set
+    stage = "08_AR" if ar_set else "07_epoched"
+
+    if chosen:
+        ep_path = download_set_and_pair(files_index, chosen, stage)
+        epochs = load_epochs_eeglab(str(ep_path))
+        if epochs is not None:
+            keys = list(epochs.event_id.keys())
+            target = keys[0] if keys else None
+            if target:
+                try:
+                    evk = epochs[target].average()
+                    fig = evk.plot(picks="Pz" if "Pz" in evk.ch_names else None, show=False)
+                    st.pyplot(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    st.error(f"Could not plot ERP: {e}")
+            else:
+                st.warning("No events found in epochs.")
+        else:
+            st.error("Failed to load epochs .set")
+    else:
+        st.info("No epoched/autoAR .set found for this participant.")
 
 
-###############################################################################
-# Main
-###############################################################################
-
+# ============================================================
+# 5) Main
+# ============================================================
 def main() -> None:
     st.set_page_config(layout="wide", page_title="COCOA Dashboard")
     st.title("COCOA EEG Analysis Dashboard")
 
-    view = st.sidebar.selectbox(
-        "Select view",
-        options=["Pre-ICA Metrics", "Visual Oddball QC"],
-        key="main_view",
-    )
+    # Always check Drive access early (fast failure is good)
+    drive_smoke_test()
+
+    folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
+    files_index = drive_index_recursive(folder_id)
+
+    view = st.sidebar.selectbox("Select view", ["Pre-ICA Metrics", "Visual Oddball QC"], key="main_view")
 
     if view == "Pre-ICA Metrics":
-        preica_view()
+        preica_view(files_index=files_index)
     else:
-        vo_qc_view()
+        vo_qc_view(files_index=files_index)
 
 
 if __name__ == "__main__":
