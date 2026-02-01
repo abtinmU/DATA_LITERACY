@@ -719,30 +719,66 @@ def comparison_view(files_index: List[Dict]) -> None:
             _download(csv["id"], local_csv)
             df = pd.read_csv(local_csv)
 
-            pid_col = next((c for c in ["participant", "participant_id", "subject_id", "sub_id", "id"] if c in df.columns), None)
-            if not pid_col:
+            # --- FIX: detect participant column even if it's unnamed ---
+            # 1) If first column is unnamed, it often contains sub-### values
+            import re
+            pattern = re.compile(r"^sub-\d+$", re.IGNORECASE)
+
+            first_col = df.columns[0]
+            if str(first_col).lower().startswith("unnamed"):
+                # check if it looks like participant ids
+                sample = df[first_col].astype(str).str.strip().dropna().head(200)
+                if len(sample) and sample.map(lambda x: bool(pattern.match(x))).mean() > 0.6:
+                    df = df.rename(columns={first_col: "participant"})
+
+            # 2) Try known column names
+            pid_col = next(
+                (c for c in ["participant", "participant_id", "subject_id", "sub_id", "id"] if c in df.columns),
+                None,
+            )
+
+            # 3) Heuristic: find any column that looks like sub-### ids
+            if pid_col is None:
+                for c in df.columns:
+                    s = df[c].astype(str).str.strip().dropna().head(200)
+                    if len(s) and s.map(lambda x: bool(pattern.match(x))).mean() > 0.6:
+                        pid_col = c
+                        break
+
+            if pid_col is None:
                 st.warning("Could not detect participant id column in CSV.")
-                st.write(list(df.columns))
-            else:
-                df[pid_col] = df[pid_col].astype(str).str.strip()
-                df = df[df[pid_col].isin(chosen)]
-                numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-                if not numeric_cols:
-                    st.warning("No numeric feature columns found.")
-                else:
-                    feat = st.selectbox("Feature", numeric_cols, index=0)
+                st.write("CSV columns:", list(df.columns))
+                st.stop()
 
-                    apply_plot_style()
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    df.boxplot(column=feat, by=pid_col, ax=ax)
-                    ax.set_title(f"{feat} by participant")
-                    ax.set_ylabel(feat)
-                    plt.suptitle("")
-                    st.pyplot(fig)
-                    plt.close(fig)
+            # normalize participant IDs
+            df[pid_col] = df[pid_col].astype(str).str.strip()
 
-                    summary = df.groupby(pid_col)[feat].agg(["count", "mean", "std", "min", "max"]).reset_index()
-                    st.dataframe(summary, use_container_width=True)
+            # filter to chosen participants
+            df = df[df[pid_col].isin(chosen)]
+            if df.empty:
+                st.warning("No rows for selected participants in this CSV.")
+                st.stop()
+
+            # numeric features only
+            numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not numeric_cols:
+                st.warning("No numeric feature columns found.")
+                st.stop()
+
+            feat = st.selectbox("Feature", numeric_cols, index=0)
+
+            apply_plot_style()
+            fig, ax = plt.subplots(figsize=(10, 4))
+            df.boxplot(column=feat, by=pid_col, ax=ax)
+            ax.set_title(f"{feat} by participant")
+            ax.set_ylabel(feat)
+            plt.suptitle("")
+            st.pyplot(fig)
+            plt.close(fig)
+
+            summary = df.groupby(pid_col)[feat].agg(["count", "mean", "std", "min", "max"]).reset_index()
+            st.dataframe(summary, use_container_width=True)
+
 
 
 # ============================================================
