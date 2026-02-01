@@ -1,320 +1,314 @@
-"""
-Streamlit dashboard for exploring the Cognitive Electrophysiology in Socioeconomic
-Context in Adulthood (COCOA) dataset.
-
-This application demonstrates a number of best practices for building an
-interactive dashboard in Streamlit:
-
-* **Data is cached** with ``st.cache_data`` so it is only loaded once per
-  session.  The Excel file provided by the user contains pre‑ICA extreme
-  loss metrics for each participant and task.
-* **Filters are generated from the data** instead of being hard‑coded.  The
-  list of participants, tasks and available EEG channels are derived from
-  the dataframe.  Selecting one or more participants automatically filters
-  the dataset used to populate subsequent controls.
-* **Visualisations respect basic plotting rules**: axes are labelled and
-  include units where appropriate, axis limits start at zero when that
-  makes sense and legends are only drawn when multiple series are present.
-  The slides on scientific plotting stress the importance of clear axis
-  labels, proper units and reasonable axis limits【239241550391385†L485-L494】.
-* **Accessible colour palettes** are used.  A small colour cycler is defined
-  using hex values inspired by the University of Tübingen palette (see the
-  ``tueplots`` documentation for reference), and these colours are cycled
-  through when plotting with Matplotlib.  This avoids the default rainbow
-  colormap and takes into account the fact that roughly 8 % of the
-  population is colour blind【239241550391385†L1000-L1009】.
-* **Multiple plot types** are supported.  Users can choose between a line
-  chart (showing channel values across participants), a histogram or a
-  boxplot.  Line charts are created with Altair for interactivity while
-  histograms and boxplots are drawn with Matplotlib so the custom colour
-  palette can be applied easily.
-* **The layout separates plots from textual information**.  Summary
-  statistics for the selected data are shown alongside the figure instead
-  of being hidden away.  This encourages a narrative around the data and
-  makes the dashboard self‑contained.
-
-This file relies only on standard Python libraries plus ``pandas``,
-``numpy``, ``altair`` and ``streamlit``.  If you wish to customise the
-Matplotlib aesthetics further (for example to exactly match the style
-bundles shown in the Data Literacy lecture), consider installing
-``tueplots`` and updating the ``plt.rcParams`` at the top of the module.
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import altair as alt
 import matplotlib.pyplot as plt
-from typing import List
-from pathlib import Path
+import mne
+import os
+import glob
+import re
+import altair as alt
 
-###############################################################################
-# Data loading and preprocessing
-###############################################################################
+# --- Configuration & Pathing ---
+PROJECT = os.path.join(os.getcwd(), "Preprocessed_VisualOddball")
 
-@st.cache_data(show_spinner=False)
-def load_data(path: str) -> pd.DataFrame:
-    """Load the Excel file containing pre‑ICA extreme loss metrics.
+# --- FILTER CONFIG (for sidebar) ---
+FILTER_CONFIG = {
+    'participant_id': {'type': 'multiselect', 'options': ['sub-001', 'sub-002', 'sub-003', 'sub-004', 'sub-005', 'sub-006', 'sub-007', 'sub-008', 'sub-009', 'sub-010', 'sub-011', 'sub-012', 'sub-013', 'sub-014', 'sub-015', 'sub-016', 'sub-017', 'sub-018', 'sub-019', 'sub-020', 'sub-021', 'sub-022', 'sub-023', 'sub-024', 'sub-025', 'sub-026', 'sub-027', 'sub-028', 'sub-029', 'sub-030', 'sub-031', 'sub-032', 'sub-033', 'sub-034', 'sub-035', 'sub-036', 'sub-037', 'sub-038', 'sub-039', 'sub-040', 'sub-041', 'sub-042', 'sub-043', 'sub-044', 'sub-045', 'sub-046', 'sub-047', 'sub-048', 'sub-049', 'sub-050', 'sub-051', 'sub-052', 'sub-053', 'sub-054', 'sub-055', 'sub-056', 'sub-057', 'sub-058', 'sub-059', 'sub-060', 'sub-061', 'sub-062', 'sub-063', 'sub-064', 'sub-065', 'sub-066', 'sub-067', 'sub-068', 'sub-069', 'sub-070', 'sub-071', 'sub-072', 'sub-073', 'sub-074', 'sub-075', 'sub-076', 'sub-077', 'sub-078', 'sub-079', 'sub-080', 'sub-081', 'sub-082', 'sub-083', 'sub-084', 'sub-085', 'sub-086', 'sub-087', 'sub-088', 'sub-089', 'sub-090', 'sub-091', 'sub-092', 'sub-093', 'sub-094', 'sub-095', 'sub-096', 'sub-097', 'sub-098', 'sub-099', 'sub-100', 'sub-101', 'sub-102', 'sub-103', 'sub-104', 'sub-105', 'sub-106', 'sub-107', 'sub-108', 'sub-109', 'sub-110', 'sub-111', 'sub-112', 'sub-113', 'sub-114', 'sub-115', 'sub-116', 'sub-117', 'sub-118', 'sub-119', 'sub-120', 'sub-121', 'sub-122', 'sub-123', 'sub-124', 'sub-125', 'sub-126', 'sub-127']},
+    # Numerical Ranges (for st.slider)
+    'Age': {'type': 'range', 'min': 18, 'max': 80, 'step': 1},
+    'Household_Members': {'type': 'range', 'min': 1, 'max': 10, 'step': 1},
+    
+    # Categorical Options (for st.multiselect) - Real values extracted from TSV
+    'Gender': {'type': 'multiselect', 'options': ['female', 'male', 'other']},
+    'Handedness': {'type': 'multiselect', 'options': ['right', 'left', 'ambidextrous']},
+    'Highest_Edu': {'type': 'multiselect', 'options': ["bachelor's degree (for example: ba, bs)", "high school graduate...", "1 or more years of college...", "professional or graduate degree"]},
+    'Occupation': {'type': 'multiselect', 'options': ['student', 'software engineer', 'janitor', 'nanny', 'unemployed', 'peer advisor (oia)']},
+    'Employed': {'type': 'multiselect', 'options': ['yes', 'no']},
+    'Employed_Yes': {'type': 'multiselect', 'options': ['full-time', 'part-time', 'self-employed']},
+    'Income': {'type': 'multiselect', 'options': ['less than $5,000', '10,000 - 12,499', '75,000 - 99,999', '100,000 or more']},
+    'Project': {'type': 'multiselect', 'options': ['COCOA', 'SASA', 'PILOT']},
+    'EEG_Tasks': {'type': 'multiselect', 'options': ['Flanker (FL), Visual Search (VS), Visual Oddball (VO)', 'Passive Auditory Oddball (TONE)', 'MIST']},
+    'fs1': {'type': 'multiselect', 'options': ['never true', 'sometimes true', 'often true', 'very often true']},
+    
+    # Placeholder for other text/object columns using the generic scale
+    'default_multiselect_options': ['Value A', 'Value B', 'Value C', 'N/A']
+}
 
-    The ``ID`` column encodes both a participant identifier (e.g.
-    ``sub-005``) and the task (e.g. ``visualoddball``).  This function
-    extracts those two pieces of information into separate columns to make
-    filtering easier.  All remaining columns correspond to EEG channel
-    metrics and are converted to numeric types where possible.
+# List of all active filter columns (derived from the new FILTER_CONFIG keys)
+ALL_FILTER_COLUMNS = [key for key in FILTER_CONFIG if key != 'default_multiselect_options']
 
-    Parameters
-    ----------
-    path : str
-        Path to the Excel file.
+# --- Helper Functions ---
+def find_any_set(folder, pattern="*.set", participant_id=None):
+    if participant_id:
+        search_path = os.path.join(PROJECT, folder, f"{participant_id}*{pattern.replace('*', '')}")
+    else:
+        search_path = os.path.join(PROJECT, folder, pattern)
+    files = sorted(glob.glob(search_path))
+    return files[0] if files else None
 
-    Returns
-    -------
-    pandas.DataFrame
-        The processed dataframe with ``participant`` and ``task`` columns.
-    """
-    df = pd.read_excel(path)
-    # Extract participant and task from the ID column
-    df['participant'] = df['ID'].str.extract(r'^(sub-\d+)')
-    df['task'] = df['ID'].str.extract(r'task-([^_]+)')
-    # Ensure numeric columns are of float type
-    for col in df.columns:
-        if col not in ['ID', 'participant', 'task']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+def plot_segment_st(raw_obj, title, ch_name="Pz", duration=10.0):
+    if ch_name in raw_obj.ch_names:
+        picks = [raw_obj.ch_names.index(ch_name)]
+    else:
+        picks = [0]
+        ch_name = raw_obj.ch_names[0]
+    sfreq = float(raw_obj.info["sfreq"])
+    data, times = raw_obj[picks, : int(sfreq * duration)]
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(times, data[0] * 1e6, lw=0.7)
+    ax.set_title(f"{title} ({ch_name})")
+    ax.set_ylabel("µV")
+    st.pyplot(fig)
+    plt.close(fig)
 
+# --- QC Functions ---
+def qc_1_raw(p_id):
+    st.header("[1] Raw Continuous Dataset")
+    path = find_any_set("01_raw", "*raw.set", p_id)
+    if not path: return st.warning("Raw file not found.")
+    
+    raw = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+    st.write(f"**File:** {os.path.basename(path)}")
+    st.info("Expected: Visible drifts, line noise, and large blinks.")
+    plot_segment_st(raw, "Raw EEG Segment", "Pz")
 
-def get_numeric_columns(df: pd.DataFrame) -> List[str]:
-    """Return a list of numeric column names representing EEG channels."""
-    return [c for c in df.columns if c not in ['ID', 'participant', 'task']]
+def qc_2_preprocessed(p_id):
+    st.header("[2] Preprocessed Dataset")
+    path = find_any_set("02_preprocessed", "*preprocessed.set", p_id)
+    if not path: return st.warning("Preprocessed file not found.")
+    
+    preproc = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+    st.write(f"**File:** {os.path.basename(path)}")
+    plot_segment_st(preproc, "Preprocessed Segment", "Pz")
+    
+    fig = preproc.compute_psd(fmin=0.1, fmax=45.0).plot(show=False)
+    st.pyplot(fig)
+    st.write("Expected: 1/f shape and alpha peak (8-12 Hz).")
 
-
-###############################################################################
-# Plotting utilities
-###############################################################################
-
-# Define a custom colour palette inspired by the University of Tübingen colours.
-# These hex codes approximate the RGB values published in the tueplots
-# documentation.  Feel free to adjust or extend this palette.
-TUE_PALETTE = [
-    '#006AA3',  # tue_blue
-    '#E65C00',  # tue_orange
-    '#A31C34',  # tue_red
-    '#5C8021',  # tue_green
-    '#735545',  # tue_brown
-    '#4A6D8C',  # tue_darkblue
-]
-
-
-def plot_line_chart(df: pd.DataFrame, channels: List[str]) -> alt.Chart:
-    """Create an interactive line chart using Altair.
-
-    The x‑axis shows the selected channels and the y‑axis the corresponding
-    measurement values.  Each selected participant is plotted as a separate
-    line and coloured automatically by Altair's default categorical palette.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Filtered dataframe containing only the selected participants.
-    channels : list of str
-        Column names (EEG channels) to include on the x‑axis.
-
-    Returns
-    -------
-    altair.Chart
-        Configured line chart.
-    """
-    # Reshape to long format for Altair
-    long_df = df.melt(id_vars=['participant'], value_vars=channels,
-                      var_name='channel', value_name='value')
-    # Order channels as specified to preserve ordering on x axis
-    channel_order = channels
-    chart = (
-        alt.Chart(long_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X('channel:N', sort=channel_order, title='EEG channel'),
-            y=alt.Y('value:Q', title='Pre‑ICA extreme loss'),
-            color=alt.Color('participant:N', title='Participant'),
-            tooltip=['participant', 'channel', 'value']
-        )
-        .properties(height=400)
-        .interactive()
-    )
-    return chart
-
-
-def plot_histograms(df: pd.DataFrame, channels: List[str]) -> None:
-    """Draw one histogram per selected channel using Matplotlib.
-
-    Each histogram is placed in its own subplot on a single figure.  Axis
-    limits start at zero because histograms represent counts.  A custom
-    colour from the TUE palette is used for each channel; colours are
-    cycled if there are more channels than colours defined.
-    """
-    n = len(channels)
-    ncols = 2
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
-    for idx, channel in enumerate(channels):
-        ax = axes[idx]
-        colour = TUE_PALETTE[idx % len(TUE_PALETTE)]
-        data = df[channel].dropna()
-        ax.hist(data, bins=20, color=colour, edgecolor='black')
-        ax.set_title(f'Distribution of {channel}')
-        ax.set_xlabel('Pre‑ICA extreme loss')
-        ax.set_ylabel('Count')
-        # Start y-axis at zero as recommended【239241550391385†L485-L494】
-        ax.set_ylim(bottom=0)
-    # Remove any unused subplots
-    for j in range(idx + 1, len(axes)):
-        fig.delaxes(axes[j])
-    fig.tight_layout()
+def qc_3_preICA_loss(p_id):
+    st.header("[3] Pre ICA Bad Channel Detection")
+    loss_xlsx = os.path.join(PROJECT, "03_preICA", "COCOA_preICAextremeloss.xlsx")
+    if not os.path.exists(loss_xlsx): return st.warning("Loss table not found.")
+    
+    df = pd.read_excel(loss_xlsx)
+    subj_data = df[df['ID'].astype(str).str.contains(p_id)]
+    if subj_data.empty: return st.write("No loss data for this subject.")
+    
+    ch_cols = [c for c in df.columns if c != "ID"]
+    values = subj_data[ch_cols].values.flatten().astype(float)
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(range(len(ch_cols)), values)
+    ax.set_ylabel("% Extreme Artifact")
+    ax.set_title(f"Artifact Loss per Channel: {p_id}")
     st.pyplot(fig)
 
+def qc_4_ICLabel(p_id):
+    st.header("[4] ICLabel Classification")
+    ic_dir = os.path.join(PROJECT, "05_ICLabel")
+    class_files = glob.glob(os.path.join(ic_dir, f"{p_id}*_ICclassifications.xlsx"))
+    
+    if class_files:
+        df = pd.read_excel(class_files[0])
+        cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
+        mean_probs = df[cols].mean()
+        fig, ax = plt.subplots()
+        mean_probs.plot(kind='bar', ax=ax)
+        st.pyplot(fig)
+    else:
+        st.warning("ICLabel file not found for this participant.")
 
-def plot_boxplot(df: pd.DataFrame, channels: List[str]) -> None:
-    """Create a boxplot for the selected channels using Matplotlib.
+def qc_5_postICA(p_id):
+    st.header("[5] Post ICA & Corrected EOG")
+    path = find_any_set("06_postICA", "*postICA.set", p_id)
+    if not path: return st.warning("Post ICA file not found.")
+    
+    try:
+        raw = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+        for ch in ["CVEOGR", "CHEOG"]:
+            if ch in raw.ch_names:
+                st.write(f"**Channel:** {ch}")
+                plot_segment_st(raw, f"Corrected {ch}", ch)
+    except Exception as e:
+        st.error(f"MNE could not open file: {e}")
 
-    Each channel’s distribution is summarised with a boxplot.  Colours are
-    cycled from the TUE palette to distinguish boxes.  Axis labels and
-    limits follow the guidelines from the lecture slides.
-    """
-    fig, ax = plt.subplots(figsize=(1 + 1.2 * len(channels), 5))
-    data = [df[ch].dropna() for ch in channels]
-    box = ax.boxplot(data, patch_artist=True, labels=channels)
-    for patch, colour in zip(box['boxes'], TUE_PALETTE):
-        patch.set_facecolor(colour)
-    ax.set_title('Distribution of selected channels')
-    ax.set_xlabel('EEG channel')
-    ax.set_ylabel('Pre‑ICA extreme loss')
-    # Optional: add grid for readability
-    ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+def qc_6_epoched(p_id):
+    st.header("[6] Epoched Data & ERP")
+    path = find_any_set("08_AR", "*autoAR.set", p_id) or find_any_set("07_epoched", "*epoched.set", p_id)
+    if not path: return st.warning("Epoched file not found.")
+    
+    epochs = mne.io.read_epochs_eeglab(path, verbose="ERROR")
+    target_code = next((k for k in epochs.event_id.keys() if '11' in str(k)), list(epochs.event_id.keys())[0])
+    evoked = epochs[target_code].average()
+    fig = evoked.plot(picks="Pz", show=False) if "Pz" in evoked.ch_names else evoked.plot(show=False)
     st.pyplot(fig)
+    st.write(f"ERP for condition: {target_code}. Expected: P3b deflection 300-500ms.")
 
-
-###############################################################################
-# Main analysis function
-###############################################################################
-
-def run_analysis(df: pd.DataFrame, selected_ids: List[str], channels: List[str],
-                 plot_type: str, model_option: str, task_option: str) -> None:
-    """Filter the dataset and generate visualisations and summary statistics.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        The full pre‑processed dataframe.
-    selected_ids : list of str
-        Participant identifiers selected via the sidebar.  If empty, all
-        participants are used.
-    channels : list of str
-        EEG channels selected for plotting.
-    plot_type : str
-        One of 'Line chart', 'Histogram' or 'Boxplot'.
-    model_option : str
-        Placeholder for future ML model selection (e.g. 'Bayesian' or
-        'Regression').  Currently not used but displayed in the sidebar.
-    task_option : str
-        Placeholder for future task selection (e.g. 'Flanker' or
-        'Visual Oddball').  Currently not used but displayed in the sidebar.
-    """
-    # Apply filters
-    if selected_ids:
-        filtered_df = df[df['participant'].isin(selected_ids)].copy()
+def qc_7_final_features():
+    st.header("[7] Final P3b Feature Distribution")
+    feat_csv = os.path.join(PROJECT, "COCOA_VO_P3b_trial_features_with_meta.csv")
+    if os.path.exists(feat_csv):
+        df = pd.read_csv(feat_csv)
+        fig, ax = plt.subplots()
+        df["roi_mean_300_600"].hist(bins=30, ax=ax)
+        ax.set_title("P3b Mean Amplitude Distribution (All Trials)")
+        st.pyplot(fig)
     else:
-        filtered_df = df.copy()
+        st.warning("Feature CSV not found.")
 
-    # Display summary metrics in the sidebar
-    with st.sidebar:
-        st.markdown('---')
-        st.subheader('Summary of Selected Data')
-        st.write(f'Number of participants: {filtered_df["participant"].nunique()}')
-        st.write(f'Number of records: {len(filtered_df)}')
-        for ch in channels:
-            values = filtered_df[ch].dropna()
-            st.write(
-                f'**{ch}**: mean = {values.mean():.2f}, std = {values.std():.2f}, '
-                f'min = {values.min():.2f}, max = {values.max():.2f}'
-            )
+# --- Run QC Analysis ---
+def run_qc_analysis(filter_selections, task_option):
+    participant_id = filter_selections.get("participant_id", [])
+    if not participant_id:
+        st.warning("Select at least one participant to run the analysis.")
+        return
+    
+    # Loop through selected participants
+    for p_id in participant_id:
+        st.markdown(f"## Participant: {p_id}")
+        qc_1_raw(p_id)
+        st.divider()
+        qc_2_preprocessed(p_id)
+        st.divider()
+        qc_3_preICA_loss(p_id)
+        st.divider()
+        qc_4_ICLabel(p_id)
+        st.divider()
+        qc_5_postICA(p_id)
+        st.divider()
+        qc_6_epoched(p_id)
+        st.divider()
+        # qc_7_final_features()
+        st.markdown("---")
 
-    # Plot area
-    plot_container = st.container()
-    with plot_container:
-        if plot_type == 'Line chart':
-            st.altair_chart(plot_line_chart(filtered_df, channels), use_container_width=True)
-        elif plot_type == 'Histogram':
-            plot_histograms(filtered_df, channels)
-        elif plot_type == 'Boxplot':
-            plot_boxplot(filtered_df, channels)
-        else:
-            st.warning('Unknown plot type selected.')
+# --- Streamlit Layout ---
+st.set_page_config(layout="wide")
+st.title("Visual Oddball EEG Analysis Dashboard (Redesigned)")
 
-    # Placeholder for ML models or further analysis
-    st.markdown('---')
-    st.subheader('Machine Learning Placeholder')
-    st.write(
-        'You selected the **{model_option}** model and the **{task_option}** task. '
-        'Implement your analysis here.'
+# Sidebar Filters
+# filter_selections = {}
+# with st.sidebar:
+#     st.header("Controls and Inputs")
+#     for col in ALL_FILTER_COLUMNS:
+#         config = FILTER_CONFIG[col]
+#         filter_selections[col] = st.multiselect(
+#             f"Select {col}:", 
+#             options=config['options'], 
+#             default=[], 
+#             placeholder="Search and select..."
+#         )
+    
+#     st.markdown("---")
+#     st.subheader("Task Selection")
+#     task_option = st.selectbox("Select Task:", ["Visual Oddball"], index=0)
+    
+#     generate_button = st.button("Generate Analysis", type="primary")
+
+filter_selections = {}
+
+with st.sidebar:
+    st.header("Controls and Inputs")
+    st.markdown("---")
+
+    # --- 1. Filter Section (Organized into Expanders) ---
+    st.subheader("Filter Task Bar (Searchable)")
+    
+    # Helper function to generate filters based on config
+    def generate_filters_for_group(cols):
+        for col in cols:
+            config = FILTER_CONFIG.get(col)
+            
+            if config and config.get('type') == 'range':
+                # Slider/Range filter
+                filter_selections[col] = st.slider(
+                    f'Filter by {col} Range:',
+                    min_value=config['min'], 
+                    max_value=config['max'], 
+                    value=(config['min'], config['max']), 
+                    step=config.get('step', 1),
+                    key=f'slider_{col}'
+                )
+            elif col in ALL_FILTER_COLUMNS:
+                # Multiselect filter (Searchable)
+                options = config['options'] if config and 'options' in config else FILTER_CONFIG['default_multiselect_options']
+                
+                filter_selections[col] = st.multiselect(
+                    f'Select {col}:',
+                    options=sorted(options),
+                    default=[],
+                    key=f'multi_{col}',
+                    placeholder="Search and select options..."
+                )
+
+    # Group 1: Identifiers and Core Demographics
+    with st.expander("ID & Core Demographics", expanded=True):
+        id_cols = ['participant_id', 'Age', 'Gender', 'Handedness', 'Highest_Edu']
+        generate_filters_for_group(id_cols)
+
+    # Group 2: Socio-Economic Status and Household
+    with st.expander("SES and Household Info"):
+        ses_cols = ['Occupation', 'Employed', 'Employed_Yes', 'Income', 'Household_Members']
+        generate_filters_for_group(ses_cols)
+
+    # Group 3: Questionnaire and Session Details
+    with st.expander("Questionnaire and Session Details"):
+        qs_cols = ['fs1', 'Project', 'EEG_Tasks']
+        generate_filters_for_group(qs_cols)
+                        
+    # Removed Adult/Relative Information and Questionnaires (fs, hnc, ASRS) & Language 
+    # to keep only active filters.
+
+
+    st.markdown("---")
+    
+    # 2. ML Model Selection (From Diagram)
+    st.subheader("ML Model")
+    model_option = st.selectbox(
+        'Select ML Model:',
+        ['Bayesian', 'Regression'],
+        key='model_select'
     )
+    st.markdown("---")
 
-
-###############################################################################
-# Streamlit App Layout
-###############################################################################
-
-def main():
-    st.set_page_config(layout='wide', page_title='COCOA EEG Dashboard')
-    st.title('COCOA EEG Dataset Analysis')
-    st.write(
-        'Explore pre‑ICA extreme loss metrics from the Cognitive Electrophysiology '
-        'in Socioeconomic Context in Adulthood (COCOA) dataset.  This dashboard '
-        'lets you filter participants, select EEG channels and visualise the data '
-        'using various plot types.  The dataset includes EEG recordings from '
-        'young adults along with socioeconomic and behavioural measures' 
-        '【850338308294355†L66-L80】.'
+    # 3. Task Selection (From Diagram)
+    st.subheader("Task")
+    task_option = st.selectbox(
+        'Select Task:',
+        ['Flanker', 'Visual Oddball'],
+        key='task_select'
     )
+    st.markdown("---")
 
-    # Load data (cloud-safe path)
-    BASE_DIR = Path(__file__).resolve().parent
-    data_path = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
-
-    if not data_path.exists():
-        st.error(f"Data file not found: {data_path}")
-        st.stop()
-
-    df = load_data(str(data_path))
+    # 4. Generate Button
+    generate_button = st.button("Generate Analysis", type="primary")
 
 
-    # Sidebar controls
-    with st.sidebar:
-        st.header('Filters')
-        st.markdown('Select one or more participants and channels to explore.')
-        # Participant filter
-        participants = sorted(df['participant'].dropna().unique())
-        selected_ids = st.multiselect('Participants', options=participants, default=[])
-        # Task filter (for information only; tasks are derived from ID)
-        tasks = sorted(df['task'].dropna().unique())
-        st.multiselect('Tasks (informative)', options=tasks, default=tasks, disabled=True)
-        # Channel selection
-        numeric_cols = get_numeric_columns(df)
-        default_channels = numeric_cols[:3]  # Show first three by default for brevity
-        channels = st.multiselect('EEG channels', options=numeric_cols,
-                                  default=default_channels)
-        # Plot type selection
-        plot_type = st.radio('Plot type', options=['Line chart', 'Histogram', 'Boxplot'])
-        # ML model and task selection (placeholders)
-        model_option = st.selectbox('ML Model', ['Bayesian', 'Regression'])
-        task_option = st.selectbox('Task', ['Flanker', 'Visual Oddball'])
-        # Trigger analysis
-        run_button = st.button('Generate Analysis', type='primary')
 
-    if run_button:
-        run_analysis(df, selected_ids, channels, plot_type, model_option, task_option)
-    else:
-        st.info('Use the controls in the sidebar to generate plots and statistics.')
+# Main Execution
+col_plots, col_text = st.columns([3, 1])
 
+if generate_button:
+    # --- Run Analysis and Display Outputs ---
+    with col_plots:
+        plot_container = st.container(border=True)
+        with plot_container:
+            # Pass user selections to the analysis function
+            run_qc_analysis(filter_selections, task_option)
 
-if __name__ == '__main__':
-    main()
+    with col_text:
+        text_container = st.container(border=True)
+        with text_container:
+            st.markdown("---")
+            st.markdown(f"**ML Model Selected:** {model_option}")
+            st.markdown(f"**Task Selected:** {task_option}")
+            st.markdown("---")
+            st.code("Detailed metrics are in the plot area.", language="markdown")
+else:
+    # Initial state
+    with col_plots:
+        st.subheader("Output Plot(s)")
+        st.info("Select options from the sidebar and press 'Generate Analysis' to run the analysis.")
+    
+    with col_text:
+        st.subheader("Text outputs (if any)")
+        st.code("Awaiting analysis results...", language="markdown")

@@ -624,20 +624,25 @@ def vo_qc_view(files_index: List[Dict]) -> None:
             st.error("MNE could not open raw file.")
             st.exception(e)
 
-    # 2) Preprocessed + PSD overlay
-    st.subheader("2) Preprocessed data and PSD overlay")
-    pre_set = find_first_match(files_index, contains=pid, endswith=stages[1][1])
-    if pre_set:
-        pre_path = download_set_and_pair(files_index, pre_set, "02_preprocessed")
-        pre_obj = load_raw_eeglab(str(pre_path))
-        if pre_obj is not None:
-            plot_segment(pre_obj, "Preprocessed segment", "Pz", 5.0)
-            if raw_obj is not None:
-                plot_psd_overlay(raw_obj, pre_obj, "Pz")
-        else:
-            st.error("Failed to load preprocessed .set (downloaded).")
+    # 2) Preprocessed (qc_2_preprocessed style)
+    st.header("[2] Preprocessed Dataset")
+
+    path = find_any_set(files_index, "02_preprocessed", "*preprocessed.set", pid)
+    if not path:
+        st.warning("Preprocessed file not found.")
     else:
-        st.warning("Preprocessed .set not found for this participant.")
+        try:
+            preproc = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+            st.write(f"**File:** {os.path.basename(path)}")
+            plot_segment_st(preproc, "Preprocessed Segment", "Pz")
+
+            fig = preproc.compute_psd(fmin=0.1, fmax=45.0, verbose="ERROR").plot(show=False)
+            st.pyplot(fig)
+            st.write("Expected: 1/f shape and alpha peak (8–12 Hz).")
+
+        except Exception as e:
+            st.error("MNE could not open preprocessed file.")
+            st.exception(e)
 
     # 3) Pre-ICA extreme-loss Excel (optional)
     st.subheader("3) Pre-ICA extreme-loss table (optional)")
