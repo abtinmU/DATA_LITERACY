@@ -1,99 +1,421 @@
-import os, glob
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import io
+import os
+import re
+import glob
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import altair as alt
+
 import mne
 
-# -----------------------------------------
-# You already have these implemented:
-# PROJECT
-# find_any_set(folder, pattern, p_id)
-# plot_segment_st(raw, title, channel)
-# qc_1_raw ... qc_7_final_features
-# -----------------------------------------
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 
-# ========= Utility helpers =========
+# =========================
+# Config
+# =========================
 
-def list_participants_from_sets() -> list[str]:
-    """Derive participant ids by scanning .set filenames across the pipeline."""
-    folders = ["01_raw", "02_preprocessed", "03_preICA", "04_ICAweighted", "06_postICA", "07_epoched", "08_AR"]
+CACHE_ROOT = Path("/tmp/cocoa_cache")
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+TUE_PALETTE = ["#006AA3", "#E65C00", "#A31C34", "#5C8021", "#735545", "#4A6D8C"]
+
+# Your stage folders
+STAGES = ["01_raw", "02_preprocessed", "03_preICA", "05_ICLabel", "06_postICA", "07_epoched", "08_AR"]
+
+# Your file naming patterns (from screenshots & your functions)
+PATTERNS = {
+    "01_raw": "*raw.set",
+    "02_preprocessed": "*preprocessed.set",
+    "06_postICA": "*postICA.set",
+    "07_epoched": "*epoched.set",
+    "08_AR": "*autoAR.set",
+}
+
+PREICA_XLSX_NAME = "COCOA_preICAextremeloss.xlsx"
+FEATURES_CSV_NAME = "COCOA_VO_P3b_trial_features_with_meta.csv"
+
+ICLABEL_SUFFIX = "_ICclassifications.xlsx"
+
+
+def apply_plot_style():
+    if st.session_state.get("_plot_style_applied"):
+        return
+    plt.rcParams.update(
+        {
+            "figure.dpi": 130,
+            "savefig.dpi": 300,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "grid.linestyle": "--",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 11,
+            "axes.titlesize": 12,
+            "legend.fontsize": 9,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "lines.linewidth": 1.3,
+        }
+    )
+    st.session_state["_plot_style_applied"] = True
+
+
+# =========================
+# Drive helpers
+# =========================
+
+def _drive_service():
+    creds_info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def drive_smoke(folder_id: str) -> Dict:
+    svc = _drive_service()
+    meta = svc.files().get(
+        fileId=folder_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    if meta.get("mimeType") != "application/vnd.google-apps.folder":
+        st.error("GDRIVE_VO_FOLDER_ID must point to a folder.")
+        st.stop()
+    return meta
+
+
+@st.cache_data(show_spinner=False)
+def drive_list_children(folder_id: str) -> List[Dict]:
+    svc = _drive_service()
+    items: List[Dict] = []
+    token = None
+    while True:
+        resp = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageToken=token,
+            pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        items.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return items
+
+
+def resolve_vo_folder_id(root_id: str) -> str:
+    """If root is DataLiteracyProject, resolve to Preprocessed_VisualOddball child folder."""
+    svc = _drive_service()
+    meta = svc.files().get(fileId=root_id, fields="id,name", supportsAllDrives=True).execute()
+    if meta.get("name") == "Preprocessed_VisualOddball":
+        return root_id
+
+    children = drive_list_children(root_id)
+    for c in children:
+        if c.get("mimeType") == "application/vnd.google-apps.folder" and c.get("name") == "Preprocessed_VisualOddball":
+            return c["id"]
+    return root_id
+
+
+@st.cache_data(show_spinner=False)
+def drive_index_recursive(folder_id: str) -> List[Dict]:
+    """Index all files (non-folders) under folder_id recursively."""
+    svc = _drive_service()
+    out: List[Dict] = []
+    queue = [folder_id]
+
+    while queue:
+        fid = queue.pop()
+        token = None
+        while True:
+            resp = svc.files().list(
+                q=f"'{fid}' in parents and trashed=false",
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageToken=token,
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            for f in resp.get("files", []):
+                if f["mimeType"] == "application/vnd.google-apps.folder":
+                    queue.append(f["id"])
+                else:
+                    out.append(f)
+
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+    return out
+
+
+def _download(file_id: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    svc = _drive_service()
+    req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+
+    with io.FileIO(dest, "wb") as fh:
+        dl = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+    return dest
+
+
+def _find_by_name(files: List[Dict], name: str) -> Optional[Dict]:
+    return next((f for f in files if f["name"] == name), None)
+
+
+def find_first_match(files: List[Dict], contains: str, endswith: str) -> Optional[Dict]:
+    hits = [f for f in files if contains in f["name"] and f["name"].endswith(endswith)]
+    hits.sort(key=lambda x: x["name"])
+    return hits[0] if hits else None
+
+
+def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path:
+    """Download .set and matching .fdt into same stage folder."""
+    set_name = set_file["name"]
+    local_set = CACHE_ROOT / stage / set_name
+    _download(set_file["id"], local_set)
+
+    if set_name.lower().endswith(".set"):
+        fdt_name = set_name[:-4] + ".fdt"
+        fdt = _find_by_name(files, fdt_name)
+        if fdt:
+            _download(fdt["id"], CACHE_ROOT / stage / fdt_name)
+    return local_set
+
+
+# =========================
+# Participant discovery
+# =========================
+
+def participants_from_index(files: List[Dict]) -> List[str]:
     ids = set()
-    for fol in folders:
-        base = os.path.join(PROJECT, fol)
-        if not os.path.isdir(base):
-            continue
-        for p in glob.glob(os.path.join(base, "*.set")):
-            bn = os.path.basename(p)
-            # expects filenames like sub-001_task-visualoddball_...
-            if "sub-" in bn:
-                ids.add(bn.split("_")[0])  # sub-001
+    for f in files:
+        m = re.search(r"(sub-\d+)", f["name"])
+        if m:
+            ids.add(m.group(1))
     return sorted(ids)
 
 
-def safe_read_raw(path: str):
-    """Read raw, raise real error to UI."""
-    try:
-        return mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
-    except Exception as e:
-        st.error(f"MNE could not open: {os.path.basename(path)}")
-        st.exception(e)
-        return None
+# =========================
+# Plot helpers
+# =========================
 
-
-def compute_channel_psd_db(raw, channel="Pz", fmin=0.5, fmax=45.0):
-    """Compute PSD for one channel and return (freqs, psd_db)."""
-    if raw is None:
-        return None
+def plot_segment_st(raw: mne.io.BaseRaw, title: str, channel: str = "Pz", duration: float = 5.0):
+    apply_plot_style()
     ch = channel if channel in raw.ch_names else raw.ch_names[0]
-    try:
-        spec = raw.compute_psd(fmin=fmin, fmax=fmax, picks=ch, verbose="ERROR")
-        freqs = spec.freqs
-        psd_db = 10 * np.log10(spec.get_data().squeeze())
-        return freqs, psd_db, ch
-    except Exception as e:
-        st.error("PSD computation failed.")
-        st.exception(e)
-        return None
+    sfreq = float(raw.info["sfreq"])
+    n = int(sfreq * duration)
+    picks = [raw.ch_names.index(ch)]
+    data, times = raw[picks, :n]
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(times, data[0] * 1e6, lw=0.9)
+    ax.set_title(f"{title} ({ch})")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.axhline(0, lw=0.5, color="gray")
+    st.pyplot(fig)
+    plt.close(fig)
 
 
-def bandpower_from_psd(freqs, psd_db, band):
-    lo, hi = band
+def compute_psd_db(raw: mne.io.BaseRaw, channel: str, fmin: float, fmax: float) -> Tuple[np.ndarray, np.ndarray, str]:
+    ch = channel if channel in raw.ch_names else raw.ch_names[0]
+    spec = raw.compute_psd(fmin=fmin, fmax=fmax, picks=ch, verbose="ERROR")
+    freqs = spec.freqs
+    psd_db = 10 * np.log10(spec.get_data().squeeze())
+    return freqs, psd_db, ch
+
+
+def bandpower(freqs: np.ndarray, psd_db: np.ndarray, lo: float, hi: float) -> float:
     mask = (freqs >= lo) & (freqs <= hi)
-    if not np.any(mask):
-        return np.nan
-    return float(np.nanmean(psd_db[mask]))
+    return float(np.nanmean(psd_db[mask])) if np.any(mask) else float("nan")
 
 
-# ========= Comparison Lab plots =========
+# =========================
+# Your QC functions (Drive-backed)
+# =========================
 
-def compare_psd_overlay(participants: list[str], stage: str, channel: str, fmin: float, fmax: float):
-    """Overlay PSDs across participants for a given pipeline stage."""
-    suffix_map = {
-        "01_raw": "*raw.set",
-        "02_preprocessed": "*preprocessed.set",
-        "06_postICA": "*postICA.set",
-    }
-    pattern = suffix_map[stage]
+def find_any_set_local(files_index: List[Dict], folder: str, pattern_endswith: str, p_id: str) -> Optional[Path]:
+    """
+    Find a file by participant and suffix, download to cache and return local path.
+    pattern_endswith should be like 'raw.set', 'preprocessed.set', 'postICA.set', 'epoched.set', 'autoAR.set'
+    """
+    hit = find_first_match(files_index, contains=p_id, endswith=pattern_endswith)
+    if not hit:
+        return None
+    return download_set_and_pair(files_index, hit, folder)
 
-    curves = []
-    for pid in participants:
-        path = find_any_set(stage, pattern, pid)
-        if not path:
-            continue
-        raw = safe_read_raw(path)
-        res = compute_channel_psd_db(raw, channel=channel, fmin=fmin, fmax=fmax)
-        if res:
-            freqs, psd_db, used_ch = res
-            curves.append((pid, freqs, psd_db, used_ch))
 
-    if not curves:
-        st.warning("No PSD data found for selected participants.")
-        return
+def qc_1_raw(files_index: List[Dict], p_id: str):
+    st.header("[1] Raw Continuous Dataset")
+    path = find_any_set_local(files_index, "01_raw", "raw.set", p_id)
+    if not path:
+        return st.warning("Raw file not found.")
+    raw = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
+    st.write(f"**File:** {path.name}")
+    st.info("Expected: Visible drifts, line noise, and large blinks.")
+    plot_segment_st(raw, "Raw EEG Segment", "Pz")
+
+
+def qc_2_preprocessed(files_index: List[Dict], p_id: str):
+    st.header("[2] Preprocessed Dataset")
+    path = find_any_set_local(files_index, "02_preprocessed", "preprocessed.set", p_id)
+    if not path:
+        return st.warning("Preprocessed file not found.")
+    preproc = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
+    st.write(f"**File:** {path.name}")
+    plot_segment_st(preproc, "Preprocessed Segment", "Pz")
+
+    fig = preproc.compute_psd(fmin=0.1, fmax=45.0, verbose="ERROR").plot(show=False)
+    st.pyplot(fig)
+    st.write("Expected: 1/f shape and alpha peak (8–12 Hz).")
+
+
+def qc_3_preICA_loss(files_index: List[Dict], p_id: str):
+    st.header("[3] Pre ICA Bad Channel Detection")
+    xlsx = _find_by_name(files_index, PREICA_XLSX_NAME)
+    if not xlsx:
+        return st.warning("Loss table not found on Drive.")
+    local = CACHE_ROOT / "03_preICA" / xlsx["name"]
+    _download(xlsx["id"], local)
+
+    df = pd.read_excel(local)
+    subj_data = df[df["ID"].astype(str).str.contains(p_id)]
+    if subj_data.empty:
+        return st.write("No loss data for this subject.")
+
+    ch_cols = [c for c in df.columns if c != "ID"]
+    values = subj_data[ch_cols].values.flatten().astype(float)
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    for pid, freqs, psd_db, used_ch in curves:
+    ax.bar(range(len(ch_cols)), values)
+    ax.set_ylabel("% Extreme Artifact")
+    ax.set_title(f"Artifact Loss per Channel: {p_id}")
+    ax.set_xticks(range(len(ch_cols)))
+    ax.set_xticklabels(ch_cols, rotation=90, fontsize=7)
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def qc_4_ICLabel(files_index: List[Dict], p_id: str):
+    st.header("[4] ICLabel Classification")
+    ic = find_first_match(files_index, contains=p_id, endswith=ICLABEL_SUFFIX)
+    if not ic:
+        return st.warning("ICLabel file not found for this participant.")
+    local = CACHE_ROOT / "05_ICLabel" / ic["name"]
+    _download(ic["id"], local)
+
+    df = pd.read_excel(local)
+    cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
+    if not set(cols).issubset(df.columns):
+        st.warning("ICLabel columns mismatch.")
+        st.write(list(df.columns))
+        return
+
+    mean_probs = df[cols].mean()
+    fig, ax = plt.subplots()
+    mean_probs.plot(kind="bar", ax=ax)
+    ax.set_ylabel("Mean probability (%)")
+    ax.set_title(f"ICLabel mean probs: {p_id}")
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def qc_5_postICA(files_index: List[Dict], p_id: str):
+    st.header("[5] Post ICA & Corrected EOG")
+    path = find_any_set_local(files_index, "06_postICA", "postICA.set", p_id)
+    if not path:
+        return st.warning("Post ICA file not found.")
+    raw = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
+    for ch in ["CVEOGR", "CHEOG"]:
+        if ch in raw.ch_names:
+            st.write(f"**Channel:** {ch}")
+            plot_segment_st(raw, f"Corrected {ch}", ch)
+
+
+def qc_6_epoched(files_index: List[Dict], p_id: str):
+    st.header("[6] Epoched Data & ERP")
+    path = find_any_set_local(files_index, "08_AR", "autoAR.set", p_id) or find_any_set_local(files_index, "07_epoched", "epoched.set", p_id)
+    if not path:
+        return st.warning("Epoched file not found.")
+
+    epochs = mne.io.read_epochs_eeglab(str(path), verbose="ERROR")
+    keys = list(epochs.event_id.keys())
+    if not keys:
+        return st.warning("No events found in epochs.")
+
+    target_code = next((k for k in keys if "11" in str(k)), keys[0])
+    evoked = epochs[target_code].average()
+
+    fig = evoked.plot(picks="Pz", show=False) if "Pz" in evoked.ch_names else evoked.plot(show=False)
+    st.pyplot(fig)
+    st.write(f"ERP for condition: {target_code}. Expected: P3b deflection 300–500ms.")
+
+
+def qc_7_final_features(files_index: List[Dict]):
+    st.header("[7] Final P3b Feature Distribution")
+    csv = _find_by_name(files_index, FEATURES_CSV_NAME)
+    if not csv:
+        return st.warning("Feature CSV not found on Drive.")
+    local = CACHE_ROOT / csv["name"]
+    _download(csv["id"], local)
+
+    df = pd.read_csv(local)
+    col = "roi_mean_300_600" if "roi_mean_300_600" in df.columns else None
+    if not col:
+        st.warning("Column roi_mean_300_600 not found.")
+        st.write(list(df.columns))
+        return
+
+    fig, ax = plt.subplots()
+    df[col].hist(bins=30, ax=ax)
+    ax.set_title("P3b Mean Amplitude Distribution (All Trials)")
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# =========================
+# Comparison lab (ALL participants)
+# =========================
+
+def compare_psd_overlay(files_index: List[Dict], participants: List[str], stage: str, channel: str, fmin: float, fmax: float):
+    pattern = PATTERNS.get(stage, "*preprocessed.set")
+    curves = []
+
+    for pid in participants:
+        path = find_any_set_local(files_index, stage, pattern.replace("*", ""), pid)
+        if not path:
+            continue
+        raw = mne.io.read_raw_eeglab(str(path), preload=False, verbose="ERROR")
+        freqs, psd_db, used_ch = compute_psd_db(raw, channel, fmin, fmax)
+        curves.append((pid, freqs, psd_db, used_ch))
+
+    if not curves:
+        st.warning("No PSD data found.")
+        return
+
+    apply_plot_style()
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for pid, freqs, psd_db, _ in curves:
         ax.plot(freqs, psd_db, label=pid)
     ax.set_title(f"PSD overlay ({stage}) @ {channel}")
     ax.set_xlabel("Frequency (Hz)")
@@ -104,105 +426,89 @@ def compare_psd_overlay(participants: list[str], stage: str, channel: str, fmin:
     plt.close(fig)
 
 
-def compare_bandpower_bars(participants: list[str], stage: str, channel: str):
-    """Bandpower-style comparison using mean PSD(dB) in common bands."""
-    bands = {
-        "delta (1–4)": (1, 4),
-        "theta (4–8)": (4, 8),
-        "alpha (8–13)": (8, 13),
-        "beta (13–30)": (13, 30),
-        "gamma (30–45)": (30, 45),
-    }
-
-    pattern = "*preprocessed.set" if stage == "02_preprocessed" else "*raw.set"
+def compare_bandpower(files_index: List[Dict], participants: List[str], stage: str, channel: str):
+    pattern = PATTERNS.get(stage, "*preprocessed.set")
     rows = []
     for pid in participants:
-        path = find_any_set(stage, pattern, pid)
+        path = find_any_set_local(files_index, stage, pattern.replace("*", ""), pid)
         if not path:
             rows.append({"participant": pid, "status": "missing"})
             continue
-        raw = safe_read_raw(path)
-        res = compute_channel_psd_db(raw, channel=channel, fmin=0.5, fmax=45.0)
-        if not res:
-            rows.append({"participant": pid, "status": "error"})
-            continue
-        freqs, psd_db, used_ch = res
-        row = {"participant": pid, "channel_used": used_ch, "status": "ok"}
-        for name, band in bands.items():
-            row[name] = bandpower_from_psd(freqs, psd_db, band)
+        raw = mne.io.read_raw_eeglab(str(path), preload=False, verbose="ERROR")
+        freqs, psd_db, used_ch = compute_psd_db(raw, channel, 0.5, 45.0)
+
+        row = {"participant": pid, "status": "ok", "channel_used": used_ch}
+        for name, (lo, hi) in {
+            "delta": (1, 4), "theta": (4, 8), "alpha": (8, 13), "beta": (13, 30), "gamma": (30, 45)
+        }.items():
+            row[name] = bandpower(freqs, psd_db, lo, hi)
         rows.append(row)
 
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
 
-    ok = df[df["status"] == "ok"].copy()
+    ok = df[df["status"] == "ok"].set_index("participant")
     if ok.empty:
-        st.warning("No successful bandpower results.")
         return
 
     fig, ax = plt.subplots(figsize=(11, 4))
-    ok.set_index("participant")[list(bands.keys())].plot(kind="bar", ax=ax)
+    ok[["delta", "theta", "alpha", "beta", "gamma"]].plot(kind="bar", ax=ax)
     ax.set_ylabel("Mean PSD (dB)")
     ax.set_title(f"Bandpower comparison ({stage}) @ {channel}")
     st.pyplot(fig)
     plt.close(fig)
 
 
-def compare_preica_heatmap(participants: list[str]):
-    """Pre-ICA extreme loss heatmap participant x channel."""
-    loss_xlsx = os.path.join(PROJECT, "03_preICA", "COCOA_preICAextremeloss.xlsx")
-    if not os.path.exists(loss_xlsx):
-        st.warning("Pre-ICA loss excel not found.")
+def compare_preica_heatmap(files_index: List[Dict], participants: List[str]):
+    xlsx = _find_by_name(files_index, PREICA_XLSX_NAME)
+    if not xlsx:
+        st.warning("PreICA loss excel not found.")
         return
+    local = CACHE_ROOT / "03_preICA" / xlsx["name"]
+    _download(xlsx["id"], local)
 
-    df = pd.read_excel(loss_xlsx)
+    df = pd.read_excel(local)
     df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
-    df = df[df["participant"].isin(participants)].copy()
-
-    ch_cols = [c for c in df.columns if c not in ["ID", "participant"]]
+    df = df[df["participant"].isin(participants)]
     if df.empty:
         st.warning("No rows for selected participants.")
         return
 
+    ch_cols = [c for c in df.columns if c not in ["ID", "participant"]]
     pivot = df.groupby("participant")[ch_cols].mean()
-
-    # Altair heatmap (clean)
     long = pivot.reset_index().melt(id_vars="participant", var_name="channel", value_name="loss")
-    import altair as alt
+
     heat = (
         alt.Chart(long)
         .mark_rect()
         .encode(
-            x=alt.X("channel:N", title="Channel"),
-            y=alt.Y("participant:N", title="Participant"),
-            color=alt.Color("loss:Q", title="Extreme loss"),
+            x="channel:N",
+            y="participant:N",
+            color="loss:Q",
             tooltip=["participant", "channel", alt.Tooltip("loss:Q", format=".3f")],
         )
-        .properties(height=min(600, 30 * len(pivot.index)))
+        .properties(height=min(600, 28 * len(pivot.index)))
     )
     st.altair_chart(heat, use_container_width=True)
 
 
-def compare_iclabel(participants: list[str]):
-    """ICLabel stacked bar compare across participants (mean probs)."""
-    ic_dir = os.path.join(PROJECT, "05_ICLabel")
+def compare_iclabel(files_index: List[Dict], participants: List[str]):
     cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
-
     rows = []
     for pid in participants:
-        files = glob.glob(os.path.join(ic_dir, f"{pid}*_ICclassifications.xlsx"))
-        if not files:
+        ic = find_first_match(files_index, contains=pid, endswith=ICLABEL_SUFFIX)
+        if not ic:
             continue
-        df = pd.read_excel(files[0])
+        local = CACHE_ROOT / "05_ICLabel" / ic["name"]
+        _download(ic["id"], local)
+        df = pd.read_excel(local)
         if not set(cols).issubset(df.columns):
             continue
-        m = df[cols].mean()
-        row = {"participant": pid}
-        row.update({c: float(m[c]) for c in cols})
-        rows.append(row)
+        means = df[cols].mean()
+        rows.append({"participant": pid, **{c: float(means[c]) for c in cols}})
 
     if not rows:
-        st.warning("No ICLabel files found (or columns mismatch) for selected participants.")
+        st.warning("No ICLabel data for selected participants.")
         return
 
     out = pd.DataFrame(rows).set_index("participant")
@@ -216,36 +522,30 @@ def compare_iclabel(participants: list[str]):
     plt.close(fig)
 
 
-def compare_p3b_features(participants: list[str]):
-    """Compare P3b features from trial_features CSV."""
-    feat_csv = os.path.join(PROJECT, "COCOA_VO_P3b_trial_features_with_meta.csv")
-    if not os.path.exists(feat_csv):
-        st.warning("Trial features CSV not found.")
+def compare_features(files_index: List[Dict], participants: List[str]):
+    csv = _find_by_name(files_index, FEATURES_CSV_NAME)
+    if not csv:
+        st.warning("Features CSV not found.")
         return
+    local = CACHE_ROOT / csv["name"]
+    _download(csv["id"], local)
+    df = pd.read_csv(local)
 
-    df = pd.read_csv(feat_csv)
-    # best guess: participant id column often called participant_id or subject_id; fallback to 'participant'
-    pid_col = None
-    for c in ["participant", "participant_id", "subject_id", "sub_id", "id"]:
-        if c in df.columns:
-            pid_col = c
-            break
+    pid_col = next((c for c in ["participant", "participant_id", "subject_id", "sub_id", "id"] if c in df.columns), None)
     if not pid_col:
-        st.warning("Could not find participant column in CSV.")
-        st.write("Columns:", list(df.columns))
+        st.warning("No participant id column found in features CSV.")
+        st.write(list(df.columns))
         return
 
     df[pid_col] = df[pid_col].astype(str).str.strip()
-    df = df[df[pid_col].isin(participants)].copy()
-
+    df = df[df[pid_col].isin(participants)]
     if df.empty:
-        st.warning("No rows for selected participants in features CSV.")
+        st.warning("No feature rows for selected participants.")
         return
 
-    feature = st.selectbox("Feature to compare", options=[c for c in df.columns if df[c].dtype != object], index=0)
-    st.write(f"Comparing feature: **{feature}**")
+    feature_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    feature = st.selectbox("Feature", feature_cols, index=0)
 
-    # boxplot
     fig, ax = plt.subplots(figsize=(10, 4))
     df.boxplot(column=feature, by=pid_col, ax=ax)
     ax.set_title(f"{feature} by participant")
@@ -254,91 +554,156 @@ def compare_p3b_features(participants: list[str]):
     st.pyplot(fig)
     plt.close(fig)
 
-    # summary table
     summary = df.groupby(pid_col)[feature].agg(["count", "mean", "std", "min", "max"]).reset_index()
     st.dataframe(summary, use_container_width=True)
 
 
 # =========================
-# Main App
+# Overview
 # =========================
+
+def cache_size_mb() -> float:
+    total = 0
+    for p in CACHE_ROOT.rglob("*"):
+        if p.is_file():
+            total += p.stat().st_size
+    return total / (1024 * 1024)
+
+
+def overview(files_index: List[Dict], root_meta: Dict):
+    st.header("Overview")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Drive folder", root_meta.get("name", ""))
+    col2.metric("Indexed files", f"{len(files_index):,}")
+    col3.metric("Participants", f"{len(participants_from_index(files_index)):,}")
+    col4.metric("Cache (MB)", f"{cache_size_mb():.1f}")
+
+    # file type distribution
+    ext_counts = {}
+    for f in files_index:
+        name = f["name"]
+        ext = name.split(".")[-1].lower() if "." in name else "(none)"
+        ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
+    df = pd.DataFrame([{"ext": k, "count": v} for k, v in sorted(ext_counts.items(), key=lambda x: -x[1])]).head(12)
+    chart = alt.Chart(df).mark_bar().encode(x="count:Q", y=alt.Y("ext:N", sort="-x")).properties(height=320)
+    st.altair_chart(chart, use_container_width=True)
+
+    st.caption("This app runs the full MNE QC pipeline on Drive-backed EEG data (cached in /tmp).")
+
+
+# =========================
+# Tools
+# =========================
+
+def sidebar_tools():
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Tools")
+    if st.sidebar.button("Clear cache (/tmp)"):
+        shutil.rmtree(CACHE_ROOT, ignore_errors=True)
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        st.sidebar.success("Cache cleared.")
+    if st.sidebar.button("Reindex Drive"):
+        drive_index_recursive.clear()
+        drive_list_children.clear()
+        st.sidebar.success("Drive cache cleared. Reload to reindex.")
+
+
+# =========================
+# Main
+# =========================
+
 def main():
     st.set_page_config(layout="wide", page_title="COCOA QC Suite")
     st.title("COCOA QC Suite")
 
-    # Navigation
-    nav = st.sidebar.radio("Mode", ["Single Participant QC", "Comparison Lab", "Run Full QC (1 subject)"], index=2)
+    root_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
+    root_meta = drive_smoke(root_id)
 
-    # Participants
-    participants = list_participants_from_sets()
-    if not participants:
-        st.error("No participants found. Check PROJECT path and folder structure.")
-        st.stop()
+    vo_id = resolve_vo_folder_id(root_id)
+    if vo_id != root_id:
+        st.caption("Auto-detected: using **Preprocessed_VisualOddball** inside the parent folder.")
 
-    if nav == "Single Participant QC":
-        pid = st.sidebar.selectbox("Participant", participants, index=0)
-        st.sidebar.markdown("---")
-        st.sidebar.write("Run individual QC steps:")
-        step = st.sidebar.selectbox("QC step", [
-            "1 Raw", "2 Preprocessed", "3 PreICA Loss", "4 ICLabel", "5 PostICA", "6 Epoched ERP", "7 Final Features"
-        ])
+    files_index = drive_index_recursive(vo_id)
+    p_all = participants_from_index(files_index)
 
-        if step == "1 Raw":
-            qc_1_raw(pid)
-        elif step == "2 Preprocessed":
-            qc_2_preprocessed(pid)
-        elif step == "3 PreICA Loss":
-            qc_3_preICA_loss(pid)
-        elif step == "4 ICLabel":
-            qc_4_ICLabel(pid)
-        elif step == "5 PostICA":
-            qc_5_postICA(pid)
-        elif step == "6 Epoched ERP":
-            qc_6_epoched(pid)
+    sidebar_tools()
+
+    nav = st.sidebar.radio("Navigation", ["Overview", "QC Single", "QC Full", "Comparison Lab"], index=0)
+
+    if nav == "Overview":
+        overview(files_index, root_meta)
+        return
+
+    if not p_all:
+        st.error("No participants found in index.")
+        return
+
+    if nav in ["QC Single", "QC Full"]:
+        pid = st.sidebar.selectbox("Participant", p_all, index=0)
+
+        if nav == "QC Single":
+            step = st.sidebar.selectbox(
+                "Step",
+                ["[1] Raw", "[2] Preprocessed", "[3] PreICA Loss", "[4] ICLabel", "[5] PostICA", "[6] Epoched", "[7] Features"],
+                index=1,
+            )
+            if step == "[1] Raw":
+                qc_1_raw(files_index, pid)
+            elif step == "[2] Preprocessed":
+                qc_2_preprocessed(files_index, pid)
+            elif step == "[3] PreICA Loss":
+                qc_3_preICA_loss(files_index, pid)
+            elif step == "[4] ICLabel":
+                qc_4_ICLabel(files_index, pid)
+            elif step == "[5] PostICA":
+                qc_5_postICA(files_index, pid)
+            elif step == "[6] Epoched":
+                qc_6_epoched(files_index, pid)
+            else:
+                qc_7_final_features(files_index)
+
         else:
-            qc_7_final_features()
+            st.sidebar.info("Runs all steps in order.")
+            qc_1_raw(files_index, pid)
+            qc_2_preprocessed(files_index, pid)
+            qc_3_preICA_loss(files_index, pid)
+            qc_4_ICLabel(files_index, pid)
+            qc_5_postICA(files_index, pid)
+            qc_6_epoched(files_index, pid)
+            qc_7_final_features(files_index)
 
-    elif nav == "Run Full QC (1 subject)":
-        pid = st.sidebar.selectbox("Participant", participants, index=0)
-        st.sidebar.info("Runs all QC steps in order.")
-        qc_1_raw(pid)
-        qc_2_preprocessed(pid)
-        qc_3_preICA_loss(pid)
-        qc_4_ICLabel(pid)
-        qc_5_postICA(pid)
-        qc_6_epoched(pid)
-        qc_7_final_features()
+        return
 
-    else:
-        st.sidebar.subheader("Comparison settings")
-        chosen = st.sidebar.multiselect("Participants", participants, default=participants[:4])
-        if len(chosen) < 2:
-            st.info("Select at least 2 participants.")
-            return
+    # Comparison Lab
+    st.header("Comparison Lab (Multi-participant)")
+    chosen = st.sidebar.multiselect("Participants", p_all, default=p_all[:6])
+    if len(chosen) < 2:
+        st.info("Select at least 2 participants.")
+        return
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "PSD Overlay", "Bandpower", "PreICA Heatmap", "ICLabel Compare", "P3b Feature Compare"
-        ])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["PSD Overlay", "Bandpower", "PreICA Heatmap", "ICLabel", "P3b Features"])
 
-        with tab1:
-            stage = st.selectbox("Stage", ["01_raw", "02_preprocessed", "06_postICA"], index=1)
-            channel = st.selectbox("Channel", ["Pz", "Cz", "Fz", "Oz"], index=0)
-            fmin, fmax = st.slider("Frequency range", 0.1, 60.0, (0.5, 45.0), 0.1)
-            compare_psd_overlay(chosen, stage, channel, fmin, fmax)
+    with tab1:
+        stage = st.selectbox("Stage", ["01_raw", "02_preprocessed", "06_postICA"], index=1)
+        channel = st.selectbox("Channel", ["Pz", "Cz", "Fz", "Oz"], index=0)
+        fmin, fmax = st.slider("PSD range (Hz)", 0.1, 60.0, (0.5, 45.0), 0.1)
+        compare_psd_overlay(files_index, chosen, stage, channel, fmin, fmax)
 
-        with tab2:
-            stage = st.selectbox("Stage for bandpower", ["01_raw", "02_preprocessed"], index=1)
-            channel = st.selectbox("Channel for bandpower", ["Pz", "Cz", "Fz", "Oz"], index=0)
-            compare_bandpower_bars(chosen, stage, channel)
+    with tab2:
+        stage = st.selectbox("Stage for bandpower", ["01_raw", "02_preprocessed"], index=1)
+        channel = st.selectbox("Channel for bandpower", ["Pz", "Cz", "Fz", "Oz"], index=0)
+        compare_bandpower(files_index, chosen, stage, channel)
 
-        with tab3:
-            compare_preica_heatmap(chosen)
+    with tab3:
+        compare_preica_heatmap(files_index, chosen)
 
-        with tab4:
-            compare_iclabel(chosen)
+    with tab4:
+        compare_iclabel(files_index, chosen)
 
-        with tab5:
-            compare_p3b_features(chosen)
+    with tab5:
+        compare_features(files_index, chosen)
 
 
 if __name__ == "__main__":
