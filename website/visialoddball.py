@@ -732,6 +732,30 @@ def vo_qc_view(files_index: List[Dict]) -> None:
         st.info("No epoched/autoAR .set found for this participant.")
 
 
+    st.header("[6] Post ICA & Corrected EOG")
+
+    path = find_any_set(files_index, "06_postICA", "*postICA.set", p_id)
+    if not path:
+        return st.warning("Post ICA file not found.")
+
+    try:
+        raw = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+        st.write(f"**File:** {os.path.basename(path)}")
+
+        found_any = False
+        for ch in ["CVEOGR", "CHEOG"]:
+            if ch in raw.ch_names:
+                found_any = True
+                st.write(f"**Channel:** {ch}")
+                plot_segment_st(raw, f"Corrected {ch}", ch)
+
+        if not found_any:
+            st.info("EOG channels (CVEOGR/CHEOG) not found in this recording.")
+
+    except Exception as e:
+        st.error("MNE could not open postICA file.")
+        st.exception(e)
+
 # ============================================================
 # 5) Sidebar tools
 # ============================================================
