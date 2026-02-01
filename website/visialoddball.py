@@ -66,27 +66,30 @@ from pathlib import Path
 # - _download(file_id: str, dest: Path) -> Path
 # - _find_by_name(files_index, name) -> Optional[Dict]
 
-def find_any_set(folder, pattern="*.set", participant_id=None):
+from pathlib import Path
+
+# expects:
+# - CACHE_ROOT = Path("/tmp/cocoa_cache")
+# - _download(file_id: str, dest: Path) -> Path
+# - _find_by_name(files_index, name) -> Optional[Dict]
+
+def find_any_set(files_index, folder, pattern="*.set", participant_id=None):
     """
-    Google Drive-backed version of find_any_set.
+    Google Drive-backed version of your original find_any_set.
 
     Returns:
         local_path (str) to downloaded .set file in /tmp cache, or None
     """
-    # pattern like "*.set" or "*raw.set" -> suffix ".set" or "raw.set"
     suffix = pattern.replace("*", "")
     if suffix == "":
         suffix = ".set"
-    files_index = drive_index_recursive(folder)
-    # Build candidate list from Drive index
+
     if participant_id:
-        # Equivalent of: f"{participant_id}*{suffix}"
         candidates = [
             f for f in files_index
             if f.get("name", "").startswith(str(participant_id)) and f["name"].endswith(suffix)
         ]
     else:
-        # Equivalent of: "*{suffix}"
         candidates = [f for f in files_index if f.get("name", "").endswith(suffix)]
 
     candidates.sort(key=lambda x: x["name"])
@@ -96,11 +99,10 @@ def find_any_set(folder, pattern="*.set", participant_id=None):
     hit = candidates[0]
     set_name = hit["name"]
 
-    # Download .set
     local_set = CACHE_ROOT / folder / set_name
     _download(hit["id"], local_set)
 
-    # If there is a paired .fdt, download it too (EEGLAB requirement)
+    # Download matching .fdt if present
     if set_name.lower().endswith(".set"):
         fdt_name = set_name[:-4] + ".fdt"
         fdt_meta = _find_by_name(files_index, fdt_name)
