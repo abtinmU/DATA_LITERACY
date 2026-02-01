@@ -516,18 +516,20 @@ def vo_qc_view(files_index: List[Dict]) -> None:
     ]
 
     # 1) Raw
-    st.subheader("1) Raw continuous data")
-    raw_set = find_first_match(files_index, contains=pid, endswith=stages[0][1])
-    raw_obj = None
-    if raw_set:
-        raw_path = download_set_and_pair(files_index, raw_set, "01_raw")
-        raw_obj = load_raw_eeglab(str(raw_path))
-        if raw_obj is not None:
-            plot_segment(raw_obj, "Raw EEG segment", "Pz", 5.0)
-        else:
-            st.error("Failed to load raw .set (downloaded).")
+    st.header("[1] Raw Continuous Dataset")
+
+    path = find_any_set("01_raw", "*raw.set", pid)
+    if not path:
+        st.warning("Raw file not found.")
     else:
-        st.warning("Raw .set not found for this participant.")
+        try:
+            raw_obj = mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+            st.write(f"**File:** {os.path.basename(path)}")
+            st.info("Expected: Visible drifts, line noise, and large blinks.")
+            plot_segment_st(raw_obj, "Raw EEG Segment", "Pz")
+        except Exception as e:
+            st.error("MNE could not open raw file.")
+            st.exception(e)
 
     # 2) Preprocessed + PSD overlay
     st.subheader("2) Preprocessed data and PSD overlay")
