@@ -84,6 +84,9 @@ def apply_plot_style() -> None:
 # Drive helpers
 # =========================
 
+
+import sys, streamlit as st
+st.write("Python:", sys.version)
 def _drive_service():
     creds_info = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
