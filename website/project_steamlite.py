@@ -46,7 +46,7 @@ import numpy as np
 import altair as alt
 import matplotlib.pyplot as plt
 from typing import List
-
+from pathlib import Path
 
 ###############################################################################
 # Data loading and preprocessing
@@ -276,9 +276,16 @@ def main():
         '【850338308294355†L66-L80】.'
     )
 
-    # Load data
-    data_path = 'COCOA_preICAextremeloss.xlsx'
-    df = load_data(data_path)
+    # Load data (cloud-safe path)
+    BASE_DIR = Path(__file__).resolve().parent
+    data_path = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
+
+    if not data_path.exists():
+        st.error(f"Data file not found: {data_path}")
+        st.stop()
+
+    df = load_data(str(data_path))
+
 
     # Sidebar controls
     with st.sidebar:
