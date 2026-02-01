@@ -406,7 +406,7 @@ def preica_view(files_index: Optional[List[Dict]] = None) -> None:
 
     df = load_preica_data_from_excel(excel_path)
     channels = get_preica_channels(df)
-    participants = sorted(df["participant"].dropna().unique().tolist())
+    participants = 128
 
     st.sidebar.subheader("Pre-ICA controls")
     selected_participants = st.sidebar.multiselect(
