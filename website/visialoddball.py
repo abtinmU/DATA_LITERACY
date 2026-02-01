@@ -121,6 +121,16 @@ def drive_smoke_test():
     )
     svc = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    test_file_id = "1aDtTneEv2-GEUBzUYHRJUMv1loxrFnJ-"
+    meta = svc.files().get(
+        fileId=test_file_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    st.success(f"✅ File reachable: {meta['name']}")
+
+
+
     # A) Check folder exists & is visible to service account
     try:
         meta = svc.files().get(
