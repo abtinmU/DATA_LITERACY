@@ -704,8 +704,8 @@ def vo_qc_view(files_index: List[Dict]) -> None:
     st.subheader("5) Epoched data & ERP (optional)")
 
     path = (
-        find_any_set(files_index, "08_AR", "*autoAR.set", p_id)
-        or find_any_set(files_index, "07_epoched", "*epoched.set", p_id)
+        find_any_set(files_index, "08_AR", "*autoAR.set", pid)
+        or find_any_set(files_index, "07_epoched", "*epoched.set", pid)
     )
     if not path:
         return st.warning("Epoched file not found.")
