@@ -103,36 +103,47 @@ def apply_plot_style() -> None:
 # ============================================================
 # 0) Drive smoke test (quick verification)
 # ============================================================
-def drive_smoke_test() -> None:
-    """Fail fast if secrets / access are wrong."""
+def drive_smoke_test():
+    import streamlit as st
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
+    sa_email = st.secrets["gcp_service_account"]["client_email"]
+
+    st.info(f"Service account: {sa_email}")
+    st.info(f"Folder ID: {folder_id}")
+
+    creds_info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # A) Check folder exists & is visible to service account
     try:
-        folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
-        _ = st.secrets["gcp_service_account"]["client_email"]
-
-        creds_info = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
-        )
-        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-        resp = svc.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id,name,mimeType)",
-            pageSize=10,
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType,owners,driveId",
             supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
         ).execute()
-
-        items = resp.get("files", [])
-        if not items:
-            st.warning("Drive API works, but the folder seems empty OR not shared with the service account.")
-        else:
-            st.success("✅ Drive API access confirmed.")
+        st.success(f"✅ Folder reachable: {meta.get('name')} | {meta.get('mimeType')}")
     except Exception as e:
-        st.error("❌ Drive access test failed. Check secrets + folder sharing.")
+        st.error("❌ Folder is NOT reachable by this service account.")
         st.exception(e)
         st.stop()
+
+    # B) List children
+    resp = svc.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        fields="files(id,name,mimeType)",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    items = resp.get("files", [])
+    st.write("Sample children:", [x["name"] for x in items])
 
 
 # ============================================================
