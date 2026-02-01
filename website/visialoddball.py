@@ -1,36 +1,24 @@
 """
 COCOA Unified Streamlit Dashboard (Streamlit Cloud-ready)
 
-✅ Pre-ICA metrics view:
-- Uses local files if present next to this script:
-    - COCOA_preICAextremeloss.xlsx
-    - participants.tsv
-- If the Excel is NOT local, it can optionally fetch it from Google Drive
-  (from the same Drive folder configured by secrets) by filename.
+Views
+- Pre-ICA metrics (Excel): local if present, else fetched from Drive by filename
+- Visual Oddball QC (Drive-backed): downloads EEGLAB .set + .fdt on-demand to /tmp cache
 
-✅ Visual Oddball QC view (Drive-backed):
-- Reads EEGLAB .set + .fdt files from Google Drive (on-demand download)
-- Caches downloaded files under /tmp/cocoa_cache so reruns are fast
-- Works with your folder-stage naming: 01_raw, 02_preprocessed, ... 08_AR
+Secrets required (Streamlit Cloud -> App -> Settings -> Secrets)
+- GDRIVE_VO_FOLDER_ID = "<folder id>"
+- [gcp_service_account] ... (service account fields including private_key)
 
-🔐 Requirements:
-- Put the service account JSON in Streamlit Cloud Secrets (NOT in code)
-- Secrets must include:
-    GDRIVE_VO_FOLDER_ID = "..."
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "..."
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-    client_email = "..."
-    client_id = "..."
-    token_uri = "https://oauth2.googleapis.com/token"
+Notes
+- If you set GDRIVE_VO_FOLDER_ID to the parent folder (DataLiteracyProject),
+  the app will automatically locate the "Preprocessed_VisualOddball" child folder.
 """
 
 from __future__ import annotations
 
 import io
 import re
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -46,7 +34,7 @@ try:
 except Exception:
     mne = None
 
-# Google Drive API (required for VO view)
+# Google Drive API (required for Drive-backed views)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -57,24 +45,16 @@ from googleapiclient.http import MediaIoBaseDownload
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_PREICA_XLSX = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
-LOCAL_PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"
+LOCAL_PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"  # optional; not required by current UI
 
 # Cache folder on Streamlit Cloud
 CACHE_ROOT = Path("/tmp/cocoa_cache")
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
-
 # -----------------------------
 # Palette / style
 # -----------------------------
-TUE_PALETTE = [
-    "#006AA3",
-    "#E65C00",
-    "#A31C34",
-    "#5C8021",
-    "#735545",
-    "#4A6D8C",
-]
+TUE_PALETTE = ["#006AA3", "#E65C00", "#A31C34", "#5C8021", "#735545", "#4A6D8C"]
 
 
 def apply_plot_style() -> None:
@@ -101,63 +81,7 @@ def apply_plot_style() -> None:
 
 
 # ============================================================
-# 0) Drive smoke test (quick verification)
-# ============================================================
-def drive_smoke_test():
-    import streamlit as st
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
-    sa_email = st.secrets["gcp_service_account"]["client_email"]
-
-    st.info(f"Service account: {sa_email}")
-    st.info(f"Folder ID: {folder_id}")
-
-    creds_info = dict(st.secrets["gcp_service_account"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-    test_file_id = "1aDtTneEv2-GEUBzUYHRJUMv1loxrFnJ-"
-    meta = svc.files().get(
-        fileId=test_file_id,
-        fields="id,name,mimeType",
-        supportsAllDrives=True,
-    ).execute()
-    st.success(f"✅ File reachable: {meta['name']}")
-
-
-
-    # A) Check folder exists & is visible to service account
-    try:
-        meta = svc.files().get(
-            fileId=folder_id,
-            fields="id,name,mimeType,owners,driveId",
-            supportsAllDrives=True,
-        ).execute()
-        st.success(f"✅ Folder reachable: {meta.get('name')} | {meta.get('mimeType')}")
-    except Exception as e:
-        st.error("❌ Folder is NOT reachable by this service account.")
-        st.exception(e)
-        st.stop()
-
-    # B) List children
-    resp = svc.files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id,name,mimeType)",
-        pageSize=10,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    items = resp.get("files", [])
-    st.write("Sample children:", [x["name"] for x in items])
-
-
-# ============================================================
-# 1) Google Drive indexing + downloading
+# 0) Drive auth + services
 # ============================================================
 def _drive_service():
     creds_info = dict(st.secrets["gcp_service_account"])
@@ -168,12 +92,60 @@ def _drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def drive_smoke_test(folder_id: str) -> None:
+    """Fail fast if secrets / sharing are wrong."""
+    try:
+        sa_email = st.secrets["gcp_service_account"]["client_email"]
+        svc = _drive_service()
+
+        # Check folder exists & is visible
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType",
+            supportsAllDrives=True,
+        ).execute()
+
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            st.error("GDRIVE_VO_FOLDER_ID is not a folder.")
+            st.stop()
+
+        st.caption(f"Drive connected as: {sa_email}")
+        st.caption(f"Root folder: {meta.get('name')} ({meta.get('id')})")
+
+    except Exception as e:
+        st.error("❌ Drive access failed. Check folder sharing + secrets.")
+        st.exception(e)
+        st.stop()
+
+
+# ============================================================
+# 1) Drive indexing + downloading
+# ============================================================
+@st.cache_data(show_spinner=False)
+def drive_list_children(folder_id: str) -> List[Dict]:
+    """List direct children of folder_id."""
+    svc = _drive_service()
+    items: List[Dict] = []
+    page_token = None
+    while True:
+        resp = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageToken=page_token,
+            pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        items.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
 @st.cache_data(show_spinner=False)
 def drive_index_recursive(folder_id: str) -> List[Dict]:
-    """
-    Recursively index ALL files under Drive folder_id.
-    Returns list of dicts: {id, name, mimeType}
-    """
+    """Recursively index all files under folder_id. Returns [{id,name,mimeType}, ...]."""
     svc = _drive_service()
     out: List[Dict] = []
     queue = [folder_id]
@@ -204,16 +176,8 @@ def drive_index_recursive(folder_id: str) -> List[Dict]:
     return out
 
 
-def participants_from_index(files: List[Dict]) -> List[str]:
-    ids = set()
-    for f in files:
-        m = re.search(r"(sub-\d+)", f["name"])
-        if m:
-            ids.add(m.group(1))
-    return sorted(ids)
-
-
 def _download(file_id: str, dest: Path) -> Path:
+    """Download a Drive file to dest (cached)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
@@ -240,9 +204,18 @@ def find_first_match(files: List[Dict], *, contains: str, endswith: str) -> Opti
     return hits[0] if hits else None
 
 
+def participants_from_index(files: List[Dict]) -> List[str]:
+    ids = set()
+    for f in files:
+        m = re.search(r"(sub-\d+)", f["name"])
+        if m:
+            ids.add(m.group(1))
+    return sorted(ids)
+
+
 def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path:
     """
-    Download .set and (if present) matching .fdt into the same folder.
+    Download .set and (if present) matching .fdt into the same stage folder.
     Returns local path to the .set file.
     """
     set_name = set_file["name"]
@@ -259,8 +232,29 @@ def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path
     return local_set
 
 
+def resolve_vo_root_folder_id(root_id: str) -> str:
+    """
+    If root_id is the parent (DataLiteracyProject), find child folder named
+    'Preprocessed_VisualOddball'. If root_id already points to that folder, return as-is.
+    """
+    svc = _drive_service()
+    meta = svc.files().get(fileId=root_id, fields="id,name,mimeType", supportsAllDrives=True).execute()
+    name = meta.get("name", "")
+    if name == "Preprocessed_VisualOddball":
+        return root_id
+
+    # Look for child folder
+    children = drive_list_children(root_id)
+    for c in children:
+        if c.get("mimeType") == "application/vnd.google-apps.folder" and c.get("name") == "Preprocessed_VisualOddball":
+            return c["id"]
+
+    # If not found, just return root_id (so error messages are meaningful later)
+    return root_id
+
+
 # ============================================================
-# 2) Pre-ICA (Excel) helpers
+# 2) Pre-ICA helpers
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_preica_data_from_excel(path: str) -> pd.DataFrame:
@@ -302,9 +296,8 @@ def plot_preica_histograms(df: pd.DataFrame, channels: List[str]) -> None:
     axes = np.ravel(axes) if isinstance(axes, np.ndarray) else [axes]
     for i, ch in enumerate(channels):
         ax = axes[i]
-        color = TUE_PALETTE[i % len(TUE_PALETTE)]
         data = df[ch].dropna()
-        ax.hist(data, bins=20, color=color, edgecolor="black")
+        ax.hist(data, bins=20, color=TUE_PALETTE[i % len(TUE_PALETTE)], edgecolor="black")
         ax.set_title(ch)
         ax.set_xlabel("Pre-ICA extreme loss")
         ax.set_ylabel("Count")
@@ -372,7 +365,6 @@ def plot_segment(raw_obj, title: str, channel: str = "Pz", duration: float = 5.0
 def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     apply_plot_style()
     fig, ax = plt.subplots(figsize=(8, 4))
-
     try:
         spec_raw = raw_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
         spec_pre = preproc_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
@@ -382,8 +374,20 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     except Exception:
         from mne.time_frequency import psd_welch
 
-        psd_raw, freqs = psd_welch(raw_obj, fmin=0.5, fmax=45.0, picks=[channel] if channel in raw_obj.ch_names else None, verbose="ERROR")
-        psd_pre, _ = psd_welch(preproc_obj, fmin=0.5, fmax=45.0, picks=[channel] if channel in preproc_obj.ch_names else None, verbose="ERROR")
+        psd_raw, freqs = psd_welch(
+            raw_obj,
+            fmin=0.5,
+            fmax=45.0,
+            picks=[channel] if channel in raw_obj.ch_names else None,
+            verbose="ERROR",
+        )
+        psd_pre, _ = psd_welch(
+            preproc_obj,
+            fmin=0.5,
+            fmax=45.0,
+            picks=[channel] if channel in preproc_obj.ch_names else None,
+            verbose="ERROR",
+        )
         psd_raw_db = 10 * np.log10(psd_raw.squeeze())
         psd_pre_db = 10 * np.log10(psd_pre.squeeze())
 
@@ -403,24 +407,21 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
 def preica_view(files_index: Optional[List[Dict]] = None) -> None:
     st.header("Pre-ICA extreme-loss exploration")
 
-    # Use local Excel if present; otherwise optionally fetch from Drive by name.
-    excel_path = None
-
+    excel_path: Optional[str] = None
     if LOCAL_PREICA_XLSX.exists():
         excel_path = str(LOCAL_PREICA_XLSX)
         st.caption("Using local COCOA_preICAextremeloss.xlsx")
     else:
-        # Optional Drive fetch (if user didn't put Excel in repo)
         if files_index is not None:
             xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
             if xlsx:
                 local = CACHE_ROOT / "preica" / xlsx["name"]
                 _download(xlsx["id"], local)
                 excel_path = str(local)
-                st.caption("Using Drive COCOA_preICAextremeloss.xlsx (downloaded to cache)")
-        if excel_path is None:
-            st.error("Pre-ICA Excel not found locally and not found on Drive.")
-            st.stop()
+                st.caption("Using Drive COCOA_preICAextremeloss.xlsx (cached)")
+    if excel_path is None:
+        st.error("Pre-ICA Excel not found (local or Drive).")
+        return
 
     df = load_preica_data_from_excel(excel_path)
     channels = get_preica_channels(df)
@@ -447,7 +448,6 @@ def preica_view(files_index: Optional[List[Dict]] = None) -> None:
     if not run:
         st.info("Select channels and click **Generate analysis**.")
         return
-
     if not selected_channels:
         st.warning("Select at least one EEG channel.")
         return
@@ -491,7 +491,7 @@ def vo_qc_view(files_index: List[Dict]) -> None:
 
     participants = participants_from_index(files_index)
     if not participants:
-        st.warning("No participant files found in the Drive folder.")
+        st.warning("No participant files found in this Drive folder.")
         return
 
     st.sidebar.subheader("VO QC controls")
@@ -502,7 +502,9 @@ def vo_qc_view(files_index: List[Dict]) -> None:
         st.info("Pick a participant and click **Run QC**.")
         return
 
-    # Your stages and suffix patterns (based on your screenshot)
+    st.markdown(f"### Participant: `{pid}`")
+
+    # Stage suffix patterns (your dataset naming)
     stages: List[Tuple[str, str]] = [
         ("01_raw", "_eeg_raw.set"),
         ("02_preprocessed", "_eeg_preprocessed.set"),
@@ -511,10 +513,7 @@ def vo_qc_view(files_index: List[Dict]) -> None:
         ("06_postICA", "_eegpostICA.set"),
         ("06_postICApracticeremoved", "_eegpostICA_practiceremoved.set"),
         ("07_epoched", "_epoched.set"),
-        # 08_AR varies; we match contains "autoAR" endswith .set
     ]
-
-    st.markdown(f"### Participant: `{pid}`")
 
     # 1) Raw
     st.subheader("1) Raw continuous data")
@@ -526,9 +525,9 @@ def vo_qc_view(files_index: List[Dict]) -> None:
         if raw_obj is not None:
             plot_segment(raw_obj, "Raw EEG segment", "Pz", 5.0)
         else:
-            st.error("Failed to load raw .set")
+            st.error("Failed to load raw .set (downloaded).")
     else:
-        st.warning("Raw .set not found.")
+        st.warning("Raw .set not found for this participant.")
 
     # 2) Preprocessed + PSD overlay
     st.subheader("2) Preprocessed data and PSD overlay")
@@ -541,12 +540,12 @@ def vo_qc_view(files_index: List[Dict]) -> None:
             if raw_obj is not None:
                 plot_psd_overlay(raw_obj, pre_obj, "Pz")
         else:
-            st.error("Failed to load preprocessed .set")
+            st.error("Failed to load preprocessed .set (downloaded).")
     else:
-        st.warning("Preprocessed .set not found.")
+        st.warning("Preprocessed .set not found for this participant.")
 
-    # 3) Pre-ICA (Excel + optional per-subject set)
-    st.subheader("3) Pre-ICA extreme-loss table (if available)")
+    # 3) Pre-ICA extreme-loss Excel (optional)
+    st.subheader("3) Pre-ICA extreme-loss table (optional)")
     preica_xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
     if preica_xlsx:
         local_xlsx = CACHE_ROOT / "03_preICA" / preica_xlsx["name"]
@@ -569,12 +568,12 @@ def vo_qc_view(files_index: List[Dict]) -> None:
             else:
                 st.info("No loss data for this participant in the Excel table.")
         else:
-            st.warning("Excel table missing 'ID' column.")
+            st.warning("Excel table found but missing 'ID' column.")
     else:
-        st.info("COCOA_preICAextremeloss.xlsx not found in Drive folder.")
+        st.info("COCOA_preICAextremeloss.xlsx not found in this Drive folder.")
 
-    # 4) ICLabel file (xlsx)
-    st.subheader("4) ICLabel classification (xlsx, if available)")
+    # 4) ICLabel xlsx (optional)
+    st.subheader("4) ICLabel classification (optional)")
     ic_xlsx = find_first_match(files_index, contains=pid, endswith="_ICclassifications.xlsx")
     if ic_xlsx:
         local_ic = CACHE_ROOT / "05_ICLabel" / ic_xlsx["name"]
@@ -586,26 +585,28 @@ def vo_qc_view(files_index: List[Dict]) -> None:
             apply_plot_style()
             mean_probs = ic_df[cols].mean()
             fig, ax = plt.subplots()
-            mean_probs.plot(kind="bar", ax=ax, color=[TUE_PALETTE[i % len(TUE_PALETTE)] for i in range(len(cols))])
+            mean_probs.plot(
+                kind="bar",
+                ax=ax,
+                color=[TUE_PALETTE[i % len(TUE_PALETTE)] for i in range(len(cols))],
+            )
             ax.set_ylabel("Mean probability (%)")
             ax.set_title("Mean ICLabel class probabilities")
             st.pyplot(fig)
             plt.close(fig)
         else:
-            st.warning("ICLabel file found, but required columns are missing.")
+            st.warning("ICLabel file found but required columns are missing.")
             st.write("Columns:", list(ic_df.columns))
     else:
         st.info("ICLabel xlsx not found for this participant.")
 
-    # 5) Epoched/AR ERP (optional)
-    st.subheader("5) Epoched data & ERP (if available)")
-    # Try autoAR first (contains "autoAR", endswith .set)
+    # 5) Epoched / AutoAR (optional)
+    st.subheader("5) Epoched data & ERP (optional)")
     ar_hits = [f for f in files_index if pid in f["name"] and "autoAR" in f["name"] and f["name"].endswith(".set")]
     ar_hits.sort(key=lambda x: x["name"])
     ar_set = ar_hits[0] if ar_hits else None
 
     ep_set = find_first_match(files_index, contains=pid, endswith="_epoched.set")
-
     chosen = ar_set or ep_set
     stage = "08_AR" if ar_set else "07_epoched"
 
@@ -626,23 +627,60 @@ def vo_qc_view(files_index: List[Dict]) -> None:
             else:
                 st.warning("No events found in epochs.")
         else:
-            st.error("Failed to load epochs .set")
+            st.error("Failed to load epochs .set (downloaded).")
     else:
         st.info("No epoched/autoAR .set found for this participant.")
 
 
 # ============================================================
-# 5) Main
+# 5) Sidebar tools
+# ============================================================
+def sidebar_tools() -> None:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Tools")
+
+    if st.sidebar.button("Clear local cache (/tmp)", help="Deletes downloaded files under /tmp/cocoa_cache"):
+        try:
+            shutil.rmtree(CACHE_ROOT, ignore_errors=True)
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            st.sidebar.success("Cache cleared.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to clear cache: {e}")
+
+    if st.sidebar.button("Reindex Drive", help="Clears cached Drive index and refetches"):
+        drive_index_recursive.clear()
+        drive_list_children.clear()
+        st.sidebar.success("Drive index cache cleared. Reload to refetch.")
+
+
+# ============================================================
+# 6) Main
 # ============================================================
 def main() -> None:
     st.set_page_config(layout="wide", page_title="COCOA Dashboard")
     st.title("COCOA EEG Analysis Dashboard")
 
-    # Always check Drive access early (fast failure is good)
-    drive_smoke_test()
+    root_folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
 
-    folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
-    files_index = drive_index_recursive(folder_id)
+    # Verify Drive access to the configured root
+    drive_smoke_test(root_folder_id)
+
+    # Resolve VO folder (in case user pointed at parent folder)
+    vo_folder_id = resolve_vo_root_folder_id(root_folder_id)
+
+    # If we failed to locate the VO folder, warn clearly
+    if vo_folder_id == root_folder_id:
+        # It might already be the correct folder OR it might be parent and missing VO folder
+        # We can detect by listing children
+        children = drive_list_children(root_folder_id)
+        child_names = {c.get("name") for c in children}
+        if "Preprocessed_VisualOddball" in child_names:
+            vo_folder_id = next(c["id"] for c in children if c.get("name") == "Preprocessed_VisualOddball")
+
+    # Index under VO folder for QC view, and (optionally) for pulling Excel
+    files_index = drive_index_recursive(vo_folder_id)
+
+    sidebar_tools()
 
     view = st.sidebar.selectbox("Select view", ["Pre-ICA Metrics", "Visual Oddball QC"], key="main_view")
 
