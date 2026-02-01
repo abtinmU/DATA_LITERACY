@@ -702,34 +702,38 @@ def vo_qc_view(files_index: List[Dict]) -> None:
 
     # 5) Epoched / AutoAR (optional)
     st.subheader("5) Epoched data & ERP (optional)")
-    ar_hits = [f for f in files_index if pid in f["name"] and "autoAR" in f["name"] and f["name"].endswith(".set")]
-    ar_hits.sort(key=lambda x: x["name"])
-    ar_set = ar_hits[0] if ar_hits else None
 
-    ep_set = find_first_match(files_index, contains=pid, endswith="_epoched.set")
-    chosen = ar_set or ep_set
-    stage = "08_AR" if ar_set else "07_epoched"
+    path = (
+        find_any_set(files_index, "08_AR", "*autoAR.set", p_id)
+        or find_any_set(files_index, "07_epoched", "*epoched.set", p_id)
+    )
+    if not path:
+        return st.warning("Epoched file not found.")
 
-    if chosen:
-        ep_path = download_set_and_pair(files_index, chosen, stage)
-        epochs = load_epochs_eeglab(str(ep_path))
-        if epochs is not None:
-            keys = list(epochs.event_id.keys())
-            target = keys[0] if keys else None
-            if target:
-                try:
-                    evk = epochs[target].average()
-                    fig = evk.plot(picks="Pz" if "Pz" in evk.ch_names else None, show=False)
-                    st.pyplot(fig)
-                    plt.close(fig)
-                except Exception as e:
-                    st.error(f"Could not plot ERP: {e}")
-            else:
-                st.warning("No events found in epochs.")
-        else:
-            st.error("Failed to load epochs .set (downloaded).")
-    else:
-        st.info("No epoched/autoAR .set found for this participant.")
+    try:
+        epochs = mne.io.read_epochs_eeglab(path, verbose="ERROR")
+        st.write(f"**File:** {os.path.basename(path)}")
+
+        if not epochs.event_id:
+            st.warning("No event_id found in this epochs file.")
+            return
+
+        # Prefer a condition containing '11', else take the first available
+        keys = list(epochs.event_id.keys())
+        target_code = next((k for k in keys if "11" in str(k)), keys[0])
+
+        evoked = epochs[target_code].average()
+        fig = evoked.plot(
+            picks="Pz" if "Pz" in evoked.ch_names else None,
+            show=False
+        )
+        st.pyplot(fig)
+        st.write(f"ERP for condition: **{target_code}**. Expected: P3b deflection 300–500ms.")
+
+    except Exception as e:
+        st.error("MNE could not open or plot epoched/ERP data.")
+        st.exception(e)
+
 
 
     st.header("[6] Post ICA & Corrected EOG")
