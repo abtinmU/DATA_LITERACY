@@ -3,18 +3,21 @@ Unified Streamlit dashboard for the COCOA project.
 
 Features:
 - Pre-ICA extreme-loss exploration (Excel)
-- Visual Oddball QC workflow (EEGLAB .set files)
-- Demographic filters (Age, Gender, Income, etc.) applied FIRST to determine the eligible participants.
-- Participant selection is optional: if empty, use all eligible participants.
+- Visual Oddball QC workflow (EEGLAB .set files) if present
+- Demographic filters (Age, Gender, Income, etc.) applied FIRST to determine eligible participants
+- Participant selection is optional: if empty, use all eligible participants
+- Uses tueplots if available (optional). Falls back gracefully if not installed.
 
-Plot styling:
-- Uses tueplots if available (recommended). Falls back gracefully if not installed.
+Cloud-safe:
+- Uses paths relative to this file (Path(__file__).parent) instead of os.getcwd()
 """
 
-import os
-import glob
+from __future__ import annotations
+
 import re
-from typing import List, Optional, Dict, Any
+import glob
+from pathlib import Path
+from typing import List, Optional, Dict
 
 import streamlit as st
 import pandas as pd
@@ -22,12 +25,13 @@ import numpy as np
 import altair as alt
 import matplotlib.pyplot as plt
 
+# Optional MNE for EEGLAB support
 try:
     import mne  # noqa: F401
 except Exception:
     mne = None
 
-# Try tueplots (optional). If not available, we fallback to a clean rcParams style.
+# Optional tueplots for style bundles
 try:
     from tueplots import bundles  # type: ignore
     TUEPLOTS_AVAILABLE = True
@@ -37,13 +41,20 @@ except Exception:
 
 
 ###############################################################################
-# Configuration
+# Paths (cloud-safe)
 ###############################################################################
 
-PREICA_XLSX = "COCOA_preICAextremeloss.xlsx"
-VO_PROJECT = os.path.join(os.getcwd(), "Preprocessed_VisualOddball")
+BASE_DIR = Path(__file__).resolve().parent
 
-# Tübingen-inspired palette (fallback / also used for consistency)
+PREICA_XLSX = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
+PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"
+VO_PROJECT = BASE_DIR / "Preprocessed_VisualOddball"  # from your screenshot
+
+
+###############################################################################
+# Palette
+###############################################################################
+
 TUE_PALETTE = [
     "#006AA3",  # blue
     "#E65C00",  # orange
@@ -53,95 +64,30 @@ TUE_PALETTE = [
     "#4A6D8C",  # dark blue
 ]
 
+
+###############################################################################
+# Filters config (same idea as your unified file)
+###############################################################################
+
 FILTER_CONFIG = {
-    "participant_id": {"type": "multiselect", "options": []},  # dynamic
     "Age": {"type": "range", "min": 18, "max": 80, "step": 1},
     "Household_Members": {"type": "range", "min": 1, "max": 10, "step": 1},
     "Gender": {"type": "multiselect", "options": ["female", "male", "other"]},
     "Handedness": {"type": "multiselect", "options": ["right", "left", "ambidextrous"]},
-    "Highest_Edu": {
-        "type": "multiselect",
-        "options": [
-            "bachelor's degree (for example: ba, bs)",
-            "high school graduate...",
-            "1 or more years of college...",
-            "professional or graduate degree",
-        ],
-    },
-    "Occupation": {
-        "type": "multiselect",
-        "options": ["student", "software engineer", "janitor", "nanny", "unemployed", "peer advisor (oia)"],
-    },
+    "Highest_Edu": {"type": "multiselect", "options": []},   # will be derived if present
+    "Occupation": {"type": "multiselect", "options": []},    # will be derived if present
     "Employed": {"type": "multiselect", "options": ["yes", "no"]},
-    "Employed_Yes": {"type": "multiselect", "options": ["full-time", "part-time", "self-employed"]},
-    "Income": {
-        "type": "multiselect",
-        "options": ["less than $5,000", "10,000 - 12,499", "75,000 - 99,999", "100,000 or more"],
-    },
-    "Project": {"type": "multiselect", "options": ["COCOA", "SASA", "PILOT"]},
-    "EEG_Tasks": {
-        "type": "multiselect",
-        "options": [
-            "Flanker (FL), Visual Search (VS), Visual Oddball (VO)",
-            "Passive Auditory Oddball (TONE)",
-            "MIST",
-        ],
-    },
-    "fs1": {"type": "multiselect", "options": ["never true", "sometimes true", "often true", "very often true"]},
-    "default_multiselect_options": ["Value A", "Value B", "Value C", "N/A"],
+    "Employed_Yes": {"type": "multiselect", "options": []},  # derived if present
+    "Income": {"type": "multiselect", "options": []},        # derived if present
+    "Project": {"type": "multiselect", "options": []},       # derived if present
+    "EEG_Tasks": {"type": "multiselect", "options": []},     # derived if present
+    "fs1": {"type": "multiselect", "options": []},           # derived if present
 }
 
-ALL_FILTER_COLUMNS = [k for k in FILTER_CONFIG if k != "default_multiselect_options"]
-
-
-###############################################################################
-# Styling (tueplots if available)
-###############################################################################
-
-def apply_plot_style() -> None:
-    """
-    Apply a global matplotlib style.
-    - If tueplots is available: use an ICML-like bundle
-    - Else: a clean fallback rcParams
-    """
-    if "plot_style_applied" in st.session_state:
-        return
-
-    if TUEPLOTS_AVAILABLE:
-        # Pick a bundle that works well for paper-like figures.
-        # If you prefer half-width, change column="half".
-        plt.rcParams.update(bundles.icml2024(column="full", nrows=1, ncols=1))
-    else:
-        # Fallback: clean defaults emphasizing readability
-        plt.rcParams.update(
-            {
-                "figure.dpi": 120,
-                "savefig.dpi": 300,
-                "axes.grid": True,
-                "grid.alpha": 0.25,
-                "grid.linestyle": "--",
-                "axes.spines.top": False,
-                "axes.spines.right": False,
-                "axes.labelsize": 11,
-                "axes.titlesize": 12,
-                "legend.fontsize": 10,
-                "xtick.labelsize": 10,
-                "ytick.labelsize": 10,
-                "lines.linewidth": 1.4,
-            }
-        )
-
-    st.session_state["plot_style_applied"] = True
-
-
-###############################################################################
-# Metadata loading + filtering (dynamic participant list)
-###############################################################################
-
 META_COL_ALIASES: Dict[str, List[str]] = {
-    "participant_id": ["participant_id", "subject_id", "sub_id", "id"],
+    "participant_id": ["participant_id", "subject_id", "sub_id", "id", "participant", "subject"],
     "Age": ["age", "Age"],
-    "Household_Members": ["household_members", "householdmembers", "household_members_count"],
+    "Household_Members": ["household_members", "householdmembers", "household_members_count", "household_members"],
     "Gender": ["gender", "sex"],
     "Handedness": ["handedness"],
     "Highest_Edu": ["highest_edu", "highest_education", "education", "edu"],
@@ -163,26 +109,95 @@ def _find_first_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
     return None
 
 
+###############################################################################
+# Plot style
+###############################################################################
+
+def apply_plot_style() -> None:
+    if st.session_state.get("_plot_style_applied"):
+        return
+
+    if TUEPLOTS_AVAILABLE:
+        plt.rcParams.update(bundles.icml2024(column="full", nrows=1, ncols=1))
+    else:
+        plt.rcParams.update(
+            {
+                "figure.dpi": 120,
+                "savefig.dpi": 300,
+                "axes.grid": True,
+                "grid.alpha": 0.25,
+                "grid.linestyle": "--",
+                "axes.spines.top": False,
+                "axes.spines.right": False,
+                "axes.labelsize": 11,
+                "axes.titlesize": 12,
+                "legend.fontsize": 10,
+                "xtick.labelsize": 10,
+                "ytick.labelsize": 10,
+                "lines.linewidth": 1.4,
+            }
+        )
+
+    st.session_state["_plot_style_applied"] = True
+
+
+###############################################################################
+# Loaders
+###############################################################################
+
 @st.cache_data(show_spinner=False)
-def load_participants_metadata() -> Optional[pd.DataFrame]:
-    candidates = [
-        os.path.join(os.getcwd(), "participants.tsv"),
-        os.path.join(VO_PROJECT, "participants.tsv"),
-        os.path.join(VO_PROJECT, "..", "participants.tsv"),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            try:
-                return pd.read_csv(path, sep="\t")
-            except Exception:
-                return None
-    return None
+def load_preica_data(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path)
+    df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
+    df["task"] = df["ID"].astype(str).str.extract(r"task-([^_]+)")
+    for c in df.columns:
+        if c not in ["ID", "participant", "task"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def get_preica_channels(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if c not in ["ID", "participant", "task"]]
+
+
+@st.cache_data(show_spinner=False)
+def load_participants_metadata(tsv_path: str) -> Optional[pd.DataFrame]:
+    if not Path(tsv_path).is_file():
+        return None
+    try:
+        return pd.read_csv(tsv_path, sep="\t")
+    except Exception:
+        return None
+
+
+###############################################################################
+# Demographic filtering
+###############################################################################
+
+def _derive_options_if_possible(meta: pd.DataFrame, field: str) -> List[str]:
+    col = _find_first_col(meta, META_COL_ALIASES.get(field, [field]))
+    if not col:
+        return []
+    vals = (
+        meta[col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    # Keep it tidy
+    vals_sorted = sorted(vals, key=lambda x: x.lower())
+    # Avoid insane lists
+    return vals_sorted[:200]
 
 
 def apply_demographic_filters_to_meta(df_meta: pd.DataFrame, selections: dict) -> pd.DataFrame:
     out = df_meta.copy()
 
-    # Age (range)
+    # Age range
     age_sel = selections.get("Age")
     if age_sel:
         col = _find_first_col(out, META_COL_ALIASES["Age"])
@@ -191,7 +206,7 @@ def apply_demographic_filters_to_meta(df_meta: pd.DataFrame, selections: dict) -
             a_min, a_max = age_sel
             out = out[(out[col] >= a_min) & (out[col] <= a_max)]
 
-    # Household members (range)
+    # Household members range
     hh_sel = selections.get("Household_Members")
     if hh_sel:
         col = _find_first_col(out, META_COL_ALIASES["Household_Members"])
@@ -200,7 +215,7 @@ def apply_demographic_filters_to_meta(df_meta: pd.DataFrame, selections: dict) -
             h_min, h_max = hh_sel
             out = out[(out[col] >= h_min) & (out[col] <= h_max)]
 
-    # Categorical fields
+    # Categorical
     categorical_fields = [
         "Gender", "Handedness", "Highest_Edu", "Occupation",
         "Employed", "Employed_Yes", "Income", "Project", "EEG_Tasks", "fs1",
@@ -226,70 +241,51 @@ def meta_participant_ids(df_meta: pd.DataFrame) -> List[str]:
     return sorted(df_meta[col].astype(str).str.strip().unique().tolist())
 
 
-def generate_filter_widgets_for_group(cols: List[str], filter_selections: dict, *, prefix: str) -> None:
-    """Create widgets for non-participant filters (Age, Gender, etc.)."""
-    for col in cols:
-        cfg = FILTER_CONFIG.get(col)
-        if not cfg:
-            continue
+def generate_filter_widgets(meta: Optional[pd.DataFrame], selections: dict, *, prefix: str) -> None:
+    # Range sliders
+    selections["Age"] = st.slider(
+        "Age range",
+        min_value=FILTER_CONFIG["Age"]["min"],
+        max_value=FILTER_CONFIG["Age"]["max"],
+        value=(FILTER_CONFIG["Age"]["min"], FILTER_CONFIG["Age"]["max"]),
+        step=FILTER_CONFIG["Age"]["step"],
+        key=f"{prefix}_age",
+    )
+    selections["Household_Members"] = st.slider(
+        "Household members range",
+        min_value=FILTER_CONFIG["Household_Members"]["min"],
+        max_value=FILTER_CONFIG["Household_Members"]["max"],
+        value=(FILTER_CONFIG["Household_Members"]["min"], FILTER_CONFIG["Household_Members"]["max"]),
+        step=FILTER_CONFIG["Household_Members"]["step"],
+        key=f"{prefix}_hh",
+    )
 
-        if cfg.get("type") == "range":
-            filter_selections[col] = st.slider(
-                f"{col} range",
-                min_value=cfg["min"],
-                max_value=cfg["max"],
-                value=(cfg["min"], cfg["max"]),
-                step=cfg.get("step", 1),
-                key=f"{prefix}_slider_{col}",
-            )
-        else:
-            options = cfg.get("options") or FILTER_CONFIG["default_multiselect_options"]
-            filter_selections[col] = st.multiselect(
-                f"{col}",
-                options=sorted(options),
-                default=[],
-                key=f"{prefix}_multi_{col}",
-                placeholder="Search and select...",
-            )
+    # Categorical filters
+    cat_fields = ["Gender", "Handedness", "Highest_Edu", "Occupation", "Employed", "Employed_Yes",
+                  "Income", "Project", "EEG_Tasks", "fs1"]
 
+    for field in cat_fields:
+        options = FILTER_CONFIG[field].get("options") or []
+        if meta is not None and not options:
+            # derive from metadata if possible
+            options = _derive_options_if_possible(meta, field)
 
-def user_changed_any_demographic_filter(selections: dict) -> bool:
-    """Detect if user deviated from defaults (so we only warn when it matters)."""
-    # Range defaults = full range
-    age = selections.get("Age")
-    if age and age != (FILTER_CONFIG["Age"]["min"], FILTER_CONFIG["Age"]["max"]):
-        return True
-    hh = selections.get("Household_Members")
-    if hh and hh != (FILTER_CONFIG["Household_Members"]["min"], FILTER_CONFIG["Household_Members"]["max"]):
-        return True
+        # keep Gender/Handedness defaults if metadata missing
+        if not options and FILTER_CONFIG[field].get("options"):
+            options = FILTER_CONFIG[field]["options"]
 
-    # Any categorical selection non-empty
-    for k, v in selections.items():
-        if k in ("Age", "Household_Members"):
-            continue
-        if isinstance(v, list) and len(v) > 0:
-            return True
-    return False
+        selections[field] = st.multiselect(
+            field,
+            options=options,
+            default=[],
+            key=f"{prefix}_{field}",
+            placeholder="Search and select...",
+        )
 
 
 ###############################################################################
-# Pre-ICA data helpers
+# Pre-ICA plotting
 ###############################################################################
-
-@st.cache_data(show_spinner=False)
-def load_preica_data(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path)
-    df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
-    df["task"] = df["ID"].astype(str).str.extract(r"task-([^_]+)")
-    for c in df.columns:
-        if c not in ["ID", "participant", "task"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def get_preica_channels(df: pd.DataFrame) -> List[str]:
-    return [c for c in df.columns if c not in ["ID", "participant", "task"]]
-
 
 def plot_preica_line(df: pd.DataFrame, channels: List[str]) -> alt.Chart:
     long_df = df.melt(id_vars=["participant"], value_vars=channels, var_name="channel", value_name="value")
@@ -345,35 +341,33 @@ def plot_preica_boxplot(df: pd.DataFrame, channels: List[str]) -> None:
 
 
 ###############################################################################
-# Visual Oddball QC helpers
+# Visual Oddball QC helpers (optional)
 ###############################################################################
 
-def list_vo_participants(project_dir: str) -> List[str]:
-    if not os.path.isdir(project_dir):
+def list_vo_participants(project_dir: Path) -> List[str]:
+    if not project_dir.is_dir():
         return []
-    files = glob.glob(os.path.join(project_dir, "**", "*.set"), recursive=True)
+    files = project_dir.rglob("*.set")
     ids = set()
     for f in files:
-        m = re.search(r"(sub-\d+)", os.path.basename(f))
+        m = re.search(r"(sub-\d+)", f.name)
         if m:
             ids.add(m.group(1))
     return sorted(ids)
 
 
 def find_vo_file(folder: str, pattern: str, participant_id: str) -> Optional[str]:
-    if not os.path.isdir(VO_PROJECT):
+    d = VO_PROJECT / folder
+    if not d.is_dir():
         return None
-    d = os.path.join(VO_PROJECT, folder)
-    if not os.path.isdir(d):
-        return None
-    glob_pattern = f"{participant_id}*{pattern.replace('*','')}"
-    hits = sorted(glob.glob(os.path.join(d, glob_pattern)))
+    # pattern example: "*raw.set" => we just use it as suffix-ish
+    hits = sorted(glob.glob(str(d / f"{participant_id}*{pattern.replace('*','')}")))
     return hits[0] if hits else None
 
 
 @st.cache_data(show_spinner=False)
 def load_raw(path: str):
-    if mne is None or not path or not os.path.exists(path):
+    if mne is None or not path or not Path(path).exists():
         return None
     try:
         return mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
@@ -383,7 +377,7 @@ def load_raw(path: str):
 
 @st.cache_data(show_spinner=False)
 def load_epochs(path: str):
-    if mne is None or not path or not os.path.exists(path):
+    if mne is None or not path or not Path(path).exists():
         return None
     try:
         return mne.io.read_epochs_eeglab(path, verbose="ERROR")
@@ -411,26 +405,20 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     apply_plot_style()
     fig, ax = plt.subplots(figsize=(8, 4))
 
-    # --- New MNE: compute_psd returns a Spectrum object ---
     try:
         spec_raw = raw_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
         spec_pre = preproc_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
-
         freqs = spec_raw.freqs
         psd_raw_db = 10 * np.log10(spec_raw.get_data().squeeze())
         psd_pre_db = 10 * np.log10(spec_pre.get_data().squeeze())
-
     except Exception:
-        # --- Old MNE fallback: psd_welch returns (psds, freqs) ---
         from mne.time_frequency import psd_welch
-
         psd_raw, freqs = psd_welch(raw_obj, fmin=0.5, fmax=45.0,
                                    picks=[channel] if channel in raw_obj.ch_names else None,
                                    verbose="ERROR")
         psd_pre, _ = psd_welch(preproc_obj, fmin=0.5, fmax=45.0,
                                picks=[channel] if channel in preproc_obj.ch_names else None,
                                verbose="ERROR")
-
         psd_raw_db = 10 * np.log10(psd_raw.squeeze())
         psd_pre_db = 10 * np.log10(psd_pre.squeeze())
 
@@ -440,43 +428,6 @@ def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("PSD (dB, V²/Hz)")
     ax.legend()
-
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-
-def plot_preica_extremeloss(subj_df: pd.DataFrame) -> None:
-    apply_plot_style()
-    ch_cols = [c for c in subj_df.columns if c not in ["ID", "participant", "task"]]
-    vals = subj_df[ch_cols].values.flatten().astype(float)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(range(len(ch_cols)), vals, color=TUE_PALETTE[3])
-    ax.axhline(10, color="gray", linestyle="--", label="10% threshold")
-    ax.set_xticks(range(len(ch_cols)))
-    ax.set_xticklabels(ch_cols, rotation=90)
-    ax.set_ylabel("% extreme artifact")
-    ax.set_title("Pre-ICA extreme-loss per channel")
-    ax.legend()
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-def plot_iclabel_summary(ic_df: pd.DataFrame) -> None:
-    apply_plot_style()
-    cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
-    if not set(cols).issubset(ic_df.columns):
-        st.warning("ICLabel summary missing required columns.")
-        return
-    mean_probs = ic_df[cols].mean()
-    fig, ax = plt.subplots()
-    mean_probs.plot(
-        kind="bar",
-        ax=ax,
-        color=[TUE_PALETTE[i % len(TUE_PALETTE)] for i in range(len(cols))],
-    )
-    ax.set_ylabel("Mean probability (%)")
-    ax.set_title("Mean ICLabel class probabilities")
     st.pyplot(fig)
     plt.close(fig)
 
@@ -484,7 +435,7 @@ def plot_iclabel_summary(ic_df: pd.DataFrame) -> None:
 def qc_workflow(participant_id: str) -> None:
     st.markdown(f"### Participant: {participant_id}")
 
-    st.subheader("1. Raw continuous data")
+    st.subheader("1) Raw continuous data")
     raw_path = find_vo_file("01_raw", "*raw.set", participant_id)
     if raw_path:
         raw = load_raw(raw_path)
@@ -495,7 +446,7 @@ def qc_workflow(participant_id: str) -> None:
     else:
         st.warning("Raw file not found.")
 
-    st.subheader("2. Preprocessed data and PSD overlay")
+    st.subheader("2) Preprocessed data + PSD overlay")
     pre_path = find_vo_file("02_preprocessed", "*preprocessed.set", participant_id)
     if pre_path:
         pre = load_raw(pre_path)
@@ -508,49 +459,13 @@ def qc_workflow(participant_id: str) -> None:
     else:
         st.warning("Preprocessed file not found.")
 
-    st.subheader("3. Pre-ICA extreme-loss")
-    loss_xlsx = os.path.join(VO_PROJECT, "03_preICA", "COCOA_preICAextremeloss.xlsx")
-    if os.path.exists(loss_xlsx):
-        df_loss = pd.read_excel(loss_xlsx)
-        df_loss["participant"] = df_loss["ID"].astype(str).str.extract(r"^(sub-\d+)")
-        df_loss["task"] = df_loss["ID"].astype(str).str.extract(r"task-([^_]+)")
-        subj = df_loss[df_loss["ID"].astype(str).str.contains(participant_id)]
-        if not subj.empty:
-            plot_preica_extremeloss(subj)
-        else:
-            st.info("No loss data for this participant.")
-    else:
-        st.warning("Loss table not found.")
-
-    st.subheader("4. ICLabel classification")
-    ic_dir = os.path.join(VO_PROJECT, "05_ICLabel")
-    ic_files = glob.glob(os.path.join(ic_dir, f"{participant_id}*_ICclassifications.xlsx"))
-    if ic_files:
-        ic_df = pd.read_excel(ic_files[0])
-        plot_iclabel_summary(ic_df)
-    else:
-        st.warning("ICLabel file not found for this participant.")
-
-    st.subheader("5. Post-ICA & corrected EOG")
-    post_path = find_vo_file("06_postICA", "*postICA.set", participant_id)
-    if post_path:
-        post = load_raw(post_path)
-        if post is not None:
-            for ch in ["CVEOGR", "CHEOG"]:
-                if ch in post.ch_names:
-                    plot_segment(post, f"Corrected {ch}", ch, 5.0)
-        else:
-            st.error("Failed to load post-ICA file.")
-    else:
-        st.warning("Post-ICA file not found.")
-
-    st.subheader("6. Epoched data & ERP")
+    st.subheader("3) Epoched data & ERP (if available)")
     ep_path = find_vo_file("08_AR", "*autoAR.set", participant_id) or find_vo_file("07_epoched", "*epoched.set", participant_id)
     if ep_path:
         epochs = load_epochs(ep_path)
         if epochs is not None:
             keys = list(epochs.event_id.keys())
-            target = next((k for k in keys if "11" in str(k)), keys[0])
+            target = keys[0]
             try:
                 evk = epochs[target].average()
                 fig = evk.plot(picks="Pz" if "Pz" in evk.ch_names else None, show=False)
@@ -573,49 +488,35 @@ def qc_workflow(participant_id: str) -> None:
 def preica_view() -> None:
     st.header("Pre-ICA extreme-loss exploration")
 
-    if not os.path.exists(PREICA_XLSX):
-        st.error(f"Missing {PREICA_XLSX} in current directory.")
-        return
+    if not PREICA_XLSX.exists():
+        st.error(f"Missing file: {PREICA_XLSX.name} (expected next to this script).")
+        st.stop()
 
-    df = load_preica_data(PREICA_XLSX)
-    all_participants_from_xlsx = sorted(df["participant"].dropna().unique().tolist())
-    channels = get_preica_channels(df)
+    df_preica = load_preica_data(str(PREICA_XLSX))
+    channels = get_preica_channels(df_preica)
 
-    meta = load_participants_metadata()
+    meta = load_participants_metadata(str(PARTICIPANTS_TSV))
 
-    st.sidebar.header("Pre-ICA Filters")
-
+    st.sidebar.header("Demographic filters (apply first)")
     filter_selections: dict = {}
+    generate_filter_widgets(meta, filter_selections, prefix="demo")
 
-    with st.sidebar.expander("ID & core demographics", expanded=True):
-        generate_filter_widgets_for_group(["Age", "Gender", "Handedness", "Highest_Edu"], filter_selections, prefix="preica_core")
+    # Eligible list comes from metadata, then intersect with Excel participants
+    all_from_xlsx = sorted(df_preica["participant"].dropna().unique().tolist())
 
-    with st.sidebar.expander("SES & household info"):
-        generate_filter_widgets_for_group(
-            ["Occupation", "Employed", "Employed_Yes", "Income", "Household_Members"],
-            filter_selections,
-            prefix="preica_ses",
-        )
-
-    with st.sidebar.expander("Questionnaire & session details"):
-        generate_filter_widgets_for_group(["fs1", "Project", "EEG_Tasks"], filter_selections, prefix="preica_qs")
-
-    # Compute eligible participant list
     if meta is not None:
         filtered_meta = apply_demographic_filters_to_meta(meta, filter_selections)
         eligible = meta_participant_ids(filtered_meta)
-        eligible = [p for p in eligible if p in all_participants_from_xlsx]
+        eligible = [p for p in eligible if p in all_from_xlsx]
     else:
-        eligible = all_participants_from_xlsx
-        # Only warn if user actually changed any demographic filter away from defaults
-        if user_changed_any_demographic_filter(filter_selections):
-            st.sidebar.warning("participants.tsv not found → demographic filters cannot be applied (showing all participants).")
+        eligible = all_from_xlsx
+        st.sidebar.warning("participants.tsv not found → demographic filters cannot be applied (showing all participants).")
 
     if not eligible:
-        st.warning("No participants match current demographic filters.")
+        st.warning("No participants match the current demographic filters.")
         return
 
-    # Participant selection is OPTIONAL
+    st.sidebar.markdown("---")
     prev_selected = st.session_state.get("preica_selected_participants", [])
     pruned_default = [p for p in prev_selected if p in eligible]
 
@@ -624,25 +525,38 @@ def preica_view() -> None:
         options=eligible,
         default=pruned_default,
         key="preica_selected_participants",
-        placeholder="Leave empty = use all filtered participants",
+        placeholder="Leave empty = use all eligible participants",
     )
 
-    st.sidebar.markdown("---")
+    default_channels = channels[:3] if channels else []
+    selected_channels = st.sidebar.multiselect(
+        "EEG channels",
+        options=channels,
+        default=default_channels,
+        key="preica_channels",
+    )
 
-    default_channels = channels[:3]
-    selected_channels = st.sidebar.multiselect("EEG channels", channels, default=default_channels, key="preica_channels")
-    plot_type = st.sidebar.radio("Plot type", ["Line chart", "Histogram", "Boxplot"], key="preica_plot_type")
+    plot_type = st.sidebar.radio(
+        "Plot type",
+        options=["Line chart", "Histogram", "Boxplot"],
+        key="preica_plot_type",
+    )
+
     generate = st.sidebar.button("Generate analysis", type="primary", key="preica_generate")
 
     if not generate:
-        st.info("Set demographic filters first (they filter the participant list). Click **Generate analysis**.")
+        st.info("Set demographic filters first. Then click **Generate analysis**.")
         return
 
-    # IMPORTANT: If user did NOT select participants, use ALL eligible
-    active_participants = selected_participants if selected_participants else eligible
-    filtered_df = df[df["participant"].isin(active_participants)].copy()
+    if not selected_channels:
+        st.warning("Select at least one EEG channel.")
+        return
 
-    st.subheader("Summary statistics")
+    # If user did NOT select participants, use ALL eligible
+    active_participants = selected_participants if selected_participants else eligible
+    filtered_df = df_preica[df_preica["participant"].isin(active_participants)].copy()
+
+    st.subheader("Summary")
     st.write(f"Eligible participants (after demographic filters): {len(eligible)}")
     st.write(f"Used participants: {len(active_participants)}")
     st.write(f"Records: {len(filtered_df)}")
@@ -663,8 +577,6 @@ def preica_view() -> None:
 
     st.subheader("Visualisation")
     if plot_type == "Line chart":
-        # Altair isn't tueplots, but it is interactive. If you want “all tueplots” strictly,
-        # switch this to Matplotlib too. Tell me and I’ll do it.
         st.altair_chart(plot_preica_line(filtered_df, selected_channels), use_container_width=True)
     elif plot_type == "Histogram":
         plot_preica_histograms(filtered_df, selected_channels)
@@ -672,23 +584,32 @@ def preica_view() -> None:
         plot_preica_boxplot(filtered_df, selected_channels)
 
     if not TUEPLOTS_AVAILABLE:
-        st.caption("Note: `tueplots` is not installed → using fallback Matplotlib styling. Install tueplots to match paper-ready style.")
+        st.caption("Note: `tueplots` not installed → using fallback Matplotlib styling.")
 
 
 def vo_qc_view() -> None:
     st.header("Visual Oddball QC workflow")
 
     if mne is None:
-        st.error("MNE is not available. Install `mne` to enable QC plots.")
+        st.error("MNE is not available. Add `mne` to requirements.txt to enable QC plots.")
+        return
+
+    if not VO_PROJECT.is_dir():
+        st.warning(f"No folder found: {VO_PROJECT.name} (expected next to this script).")
         return
 
     participants = list_vo_participants(VO_PROJECT)
     if not participants:
-        st.warning("No Visual Oddball data found. Put EEGLAB .set files under Preprocessed_VisualOddball/")
+        st.warning("No .set files found under Preprocessed_VisualOddball/.")
         return
 
-    st.sidebar.header("Visual Oddball Filters")
-    selected_ids = st.sidebar.multiselect("Participants", participants, default=participants[:1], key="vo_participants")
+    st.sidebar.header("Visual Oddball QC")
+    selected_ids = st.sidebar.multiselect(
+        "Participants",
+        options=participants,
+        default=participants[:1],
+        key="vo_participants",
+    )
     run_button = st.sidebar.button("Run QC workflow", type="primary", key="vo_run")
 
     if not run_button:
@@ -699,7 +620,7 @@ def vo_qc_view() -> None:
         qc_workflow(p)
 
     if not TUEPLOTS_AVAILABLE:
-        st.caption("Note: `tueplots` is not installed → using fallback Matplotlib styling. Install tueplots to match paper-ready style.")
+        st.caption("Note: `tueplots` not installed → using fallback Matplotlib styling.")
 
 
 ###############################################################################
@@ -710,7 +631,11 @@ def main() -> None:
     st.set_page_config(layout="wide", page_title="COCOA Dashboard")
     st.title("COCOA EEG Analysis Dashboard")
 
-    view = st.sidebar.selectbox("Select view", ["Pre-ICA Metrics", "Visual Oddball QC"], key="main_view")
+    view = st.sidebar.selectbox(
+        "Select view",
+        options=["Pre-ICA Metrics", "Visual Oddball QC"],
+        key="main_view",
+    )
 
     if view == "Pre-ICA Metrics":
         preica_view()
