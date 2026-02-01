@@ -734,7 +734,7 @@ def vo_qc_view(files_index: List[Dict]) -> None:
 
     st.header("[6] Post ICA & Corrected EOG")
 
-    path = find_any_set(files_index, "06_postICA", "*postICA.set", p_id)
+    path = find_any_set(files_index, "06_postICA", "*postICA.set", pid)
     if not path:
         return st.warning("Post ICA file not found.")
 
