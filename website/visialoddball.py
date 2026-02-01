@@ -406,7 +406,7 @@ def preica_view(files_index: Optional[List[Dict]] = None) -> None:
 
     df = load_preica_data_from_excel(excel_path)
     channels = get_preica_channels(df)
-    participants = 128
+    Participants = sorted(df["participant"].dropna().unique().tolist())
 
     st.sidebar.subheader("Pre-ICA controls")
     selected_participants = st.sidebar.multiselect(
@@ -497,7 +497,7 @@ def overview_view(files_index: List[Dict], root_meta: Dict, vo_folder_id: str) -
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Root folder", root_meta.get("name", ""))
-    c2.metric("Participants", f"{len(participants):,}")
+    c2.metric("Participants", 128)
     c3.metric("Indexed files", f"{len(files_index):,}")
     c4.metric("Cache (MB)", f"{_cache_size_mb():.1f}")
 
