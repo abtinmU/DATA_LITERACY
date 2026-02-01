@@ -60,7 +60,7 @@ TUE_PALETTE = ["#006AA3", "#E65C00", "#A31C34", "#5C8021", "#735545", "#4A6D8C"]
 import os
 from pathlib import Path
 
-# expects:
+# expects:files_index
 # - files_index: List[Dict]  (Drive recursive index)
 # - CACHE_ROOT = Path("/tmp/cocoa_cache")
 # - _download(file_id: str, dest: Path) -> Path
@@ -77,7 +77,7 @@ def find_any_set(folder, pattern="*.set", participant_id=None):
     suffix = pattern.replace("*", "")
     if suffix == "":
         suffix = ".set"
-
+    files_index = drive_index_recursive(folder)
     # Build candidate list from Drive index
     if participant_id:
         # Equivalent of: f"{participant_id}*{suffix}"
