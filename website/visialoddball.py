@@ -411,7 +411,7 @@ def preica_view(files_index: Optional[List[Dict]] = None) -> None:
     st.sidebar.subheader("Pre-ICA controls")
     selected_participants = st.sidebar.multiselect(
         "Participants (optional)",
-        options=participants,
+        options=Participants,
         default=[],
         placeholder="Leave empty = all participants",
         key="preica_participants",
