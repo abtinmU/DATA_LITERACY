@@ -28,11 +28,27 @@ import numpy as np
 import altair as alt
 import matplotlib.pyplot as plt
 
-# Optional MNE (needed for .set files)
+# ---- SciPy/MNE compatibility shim for Python 3.13 ----
+# New SciPy removed sph_harm; MNE still imports it.
+# We recreate sph_harm using sph_harm_y with correct argument mapping.
 try:
-    import mne  # noqa: F401
+    import scipy.special as _sp
+
+    if not hasattr(_sp, "sph_harm") and hasattr(_sp, "sph_harm_y"):
+        def sph_harm(m, n, theta, phi, out=None):
+            # Old sph_harm: (m, n, theta=azimuth, phi=polar)
+            # New sph_harm_y: (n, m, theta=polar, phi=azimuth)
+            # => swap (theta, phi) and swap (m, n)
+            y = _sp.sph_harm_y(n, m, phi, theta)
+            return y if out is None else np.copyto(out, y)
+
+        _sp.sph_harm = sph_harm  # monkeypatch so `from scipy.special import sph_harm` works
+
 except Exception:
-    mne = None
+    pass
+
+import mne
+
 
 # Google Drive API (required for Drive-backed views)
 from google.oauth2 import service_account
