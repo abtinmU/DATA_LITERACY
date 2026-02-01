@@ -19,5 +19,5 @@ google-auth==2.29.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
 
-pymatreader==1.0.0
-h5py==2.3.5
+# pymatreader==1.1.0
+# h5py==2.3.5
