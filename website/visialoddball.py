@@ -73,24 +73,30 @@ from pathlib import Path
 # - _download(file_id: str, dest: Path) -> Path
 # - _find_by_name(files_index, name) -> Optional[Dict]
 
+from pathlib import Path
+
 def find_any_set(files_index, folder, pattern="*.set", participant_id=None):
     """
-    Google Drive-backed version of your original find_any_set.
-
-    Returns:
-        local_path (str) to downloaded .set file in /tmp cache, or None
+    Drive-backed find_any_set.
+    Returns local path to downloaded .set in /tmp cache, or None.
     """
     suffix = pattern.replace("*", "")
     if suffix == "":
         suffix = ".set"
 
+    # Only keep valid dict entries
+    valid = [
+        f for f in files_index
+        if isinstance(f, dict) and "name" in f and "id" in f
+    ]
+
     if participant_id:
         candidates = [
-            f for f in files_index
-            if f.get("name", "").startswith(str(participant_id)) and f["name"].endswith(suffix)
+            f for f in valid
+            if f["name"].startswith(str(participant_id)) and f["name"].endswith(suffix)
         ]
     else:
-        candidates = [f for f in files_index if f.get("name", "").endswith(suffix)]
+        candidates = [f for f in valid if f["name"].endswith(suffix)]
 
     candidates.sort(key=lambda x: x["name"])
     if not candidates:
@@ -102,15 +108,16 @@ def find_any_set(files_index, folder, pattern="*.set", participant_id=None):
     local_set = CACHE_ROOT / folder / set_name
     _download(hit["id"], local_set)
 
-    # Download matching .fdt if present
+    # download matching .fdt if exists
     if set_name.lower().endswith(".set"):
         fdt_name = set_name[:-4] + ".fdt"
-        fdt_meta = _find_by_name(files_index, fdt_name)
+        fdt_meta = next((x for x in valid if x["name"] == fdt_name), None)
         if fdt_meta:
             local_fdt = CACHE_ROOT / folder / fdt_name
             _download(fdt_meta["id"], local_fdt)
 
     return str(local_set)
+
 
 
 def apply_plot_style() -> None:
@@ -537,6 +544,20 @@ def preica_view(files_index: Optional[List[Dict]] = None) -> None:
     else:
         plot_preica_boxplot(fdf, selected_channels)
 
+def plot_segment_st(raw_obj, title, ch_name="Pz", duration=10.0):
+    if ch_name in raw_obj.ch_names:
+        picks = [raw_obj.ch_names.index(ch_name)]
+    else:
+        picks = [0]
+        ch_name = raw_obj.ch_names[0]
+    sfreq = float(raw_obj.info["sfreq"])
+    data, times = raw_obj[picks, : int(sfreq * duration)]
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(times, data[0] * 1e6, lw=0.7)
+    ax.set_title(f"{title} ({ch_name})")
+    ax.set_ylabel("µV")
+    st.pyplot(fig)
+    plt.close(fig)
 
 def vo_qc_view(files_index: List[Dict]) -> None:
     st.header("Visual Oddball QC (Google Drive)")
@@ -574,7 +595,7 @@ def vo_qc_view(files_index: List[Dict]) -> None:
     # 1) Raw
     st.header("[1] Raw Continuous Dataset")
 
-    path = find_any_set("01_raw", "*raw.set", pid)
+    path = find_any_set(files_index, "01_raw", "*raw.set", pid)
     if not path:
         st.warning("Raw file not found.")
     else:
