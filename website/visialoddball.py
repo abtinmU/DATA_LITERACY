@@ -1,9 +1,23 @@
+"""
+COCOA Unified Streamlit Dashboard (Streamlit Cloud-ready)
+
+Views
+- Pre-ICA metrics (Excel): local if present, else fetched from Drive by filename
+- Visual Oddball QC (Drive-backed): downloads EEGLAB .set + .fdt on-demand to /tmp cache
+
+Secrets required (Streamlit Cloud -> App -> Settings -> Secrets)
+- GDRIVE_VO_FOLDER_ID = "<folder id>"
+- [gcp_service_account] ... (service account fields including private_key)
+
+Notes
+- If you set GDRIVE_VO_FOLDER_ID to the parent folder (DataLiteracyProject),
+  the app will automatically locate the "Preprocessed_VisualOddball" child folder.
+"""
+
 from __future__ import annotations
 
 import io
-import os
 import re
-import glob
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,49 +25,44 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import altair as alt
+import matplotlib.pyplot as plt
 
-import mne
+# Optional MNE (needed for .set files)
+try:
+    import mne  # noqa: F401
+except Exception:
+    mne = None
 
+# Google Drive API (required for Drive-backed views)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 
-# =========================
-# Config
-# =========================
+# -----------------------------
+# Local paths (repo)
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent
+LOCAL_PREICA_XLSX = BASE_DIR / "COCOA_preICAextremeloss.xlsx"
+LOCAL_PARTICIPANTS_TSV = BASE_DIR / "participants.tsv"  # optional; not required by current UI
 
+# Cache folder on Streamlit Cloud
 CACHE_ROOT = Path("/tmp/cocoa_cache")
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
+# -----------------------------
+# Palette / style
+# -----------------------------
 TUE_PALETTE = ["#006AA3", "#E65C00", "#A31C34", "#5C8021", "#735545", "#4A6D8C"]
 
-# Your stage folders
-STAGES = ["01_raw", "02_preprocessed", "03_preICA", "05_ICLabel", "06_postICA", "07_epoched", "08_AR"]
 
-# Your file naming patterns (from screenshots & your functions)
-PATTERNS = {
-    "01_raw": "*raw.set",
-    "02_preprocessed": "*preprocessed.set",
-    "06_postICA": "*postICA.set",
-    "07_epoched": "*epoched.set",
-    "08_AR": "*autoAR.set",
-}
-
-PREICA_XLSX_NAME = "COCOA_preICAextremeloss.xlsx"
-FEATURES_CSV_NAME = "COCOA_VO_P3b_trial_features_with_meta.csv"
-
-ICLABEL_SUFFIX = "_ICclassifications.xlsx"
-
-
-def apply_plot_style():
+def apply_plot_style() -> None:
     if st.session_state.get("_plot_style_applied"):
         return
     plt.rcParams.update(
         {
-            "figure.dpi": 130,
+            "figure.dpi": 120,
             "savefig.dpi": 300,
             "axes.grid": True,
             "grid.alpha": 0.25,
@@ -62,90 +71,93 @@ def apply_plot_style():
             "axes.spines.right": False,
             "axes.labelsize": 11,
             "axes.titlesize": 12,
-            "legend.fontsize": 9,
+            "legend.fontsize": 10,
             "xtick.labelsize": 10,
             "ytick.labelsize": 10,
-            "lines.linewidth": 1.3,
+            "lines.linewidth": 1.4,
         }
     )
     st.session_state["_plot_style_applied"] = True
 
 
-# =========================
-# Drive helpers
-# =========================
-
+# ============================================================
+# 0) Drive auth + services
+# ============================================================
 def _drive_service():
     creds_info = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def drive_smoke(folder_id: str) -> Dict:
-    svc = _drive_service()
-    meta = svc.files().get(
-        fileId=folder_id,
-        fields="id,name,mimeType",
-        supportsAllDrives=True,
-    ).execute()
-    if meta.get("mimeType") != "application/vnd.google-apps.folder":
-        st.error("GDRIVE_VO_FOLDER_ID must point to a folder.")
+def drive_smoke_test(folder_id: str) -> None:
+    """Fail fast if secrets / sharing are wrong."""
+    try:
+        sa_email = st.secrets["gcp_service_account"]["client_email"]
+        svc = _drive_service()
+
+        # Check folder exists & is visible
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType",
+            supportsAllDrives=True,
+        ).execute()
+
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            st.error("GDRIVE_VO_FOLDER_ID is not a folder.")
+            st.stop()
+
+        st.caption(f"Drive connected as: {sa_email}")
+        st.caption(f"Root folder: {meta.get('name')} ({meta.get('id')})")
+
+    except Exception as e:
+        st.error("❌ Drive access failed. Check folder sharing + secrets.")
+        st.exception(e)
         st.stop()
-    return meta
 
 
+# ============================================================
+# 1) Drive indexing + downloading
+# ============================================================
 @st.cache_data(show_spinner=False)
 def drive_list_children(folder_id: str) -> List[Dict]:
+    """List direct children of folder_id."""
     svc = _drive_service()
     items: List[Dict] = []
-    token = None
+    page_token = None
     while True:
         resp = svc.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             fields="nextPageToken, files(id,name,mimeType)",
-            pageToken=token,
+            pageToken=page_token,
             pageSize=1000,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
         items.extend(resp.get("files", []))
-        token = resp.get("nextPageToken")
-        if not token:
+        page_token = resp.get("nextPageToken")
+        if not page_token:
             break
     return items
 
 
-def resolve_vo_folder_id(root_id: str) -> str:
-    """If root is DataLiteracyProject, resolve to Preprocessed_VisualOddball child folder."""
-    svc = _drive_service()
-    meta = svc.files().get(fileId=root_id, fields="id,name", supportsAllDrives=True).execute()
-    if meta.get("name") == "Preprocessed_VisualOddball":
-        return root_id
-
-    children = drive_list_children(root_id)
-    for c in children:
-        if c.get("mimeType") == "application/vnd.google-apps.folder" and c.get("name") == "Preprocessed_VisualOddball":
-            return c["id"]
-    return root_id
-
-
 @st.cache_data(show_spinner=False)
 def drive_index_recursive(folder_id: str) -> List[Dict]:
-    """Index all files (non-folders) under folder_id recursively."""
+    """Recursively index all files under folder_id. Returns [{id,name,mimeType}, ...]."""
     svc = _drive_service()
     out: List[Dict] = []
     queue = [folder_id]
 
     while queue:
         fid = queue.pop()
-        token = None
+        page_token = None
         while True:
             resp = svc.files().list(
                 q=f"'{fid}' in parents and trashed=false",
                 fields="nextPageToken, files(id,name,mimeType)",
-                pageToken=token,
+                pageToken=page_token,
                 pageSize=1000,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
@@ -157,25 +169,28 @@ def drive_index_recursive(folder_id: str) -> List[Dict]:
                 else:
                     out.append(f)
 
-            token = resp.get("nextPageToken")
-            if not token:
+            page_token = resp.get("nextPageToken")
+            if not page_token:
                 break
+
     return out
 
 
 def _download(file_id: str, dest: Path) -> Path:
+    """Download a Drive file to dest (cached)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
 
     svc = _drive_service()
-    req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+    request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
 
     with io.FileIO(dest, "wb") as fh:
-        dl = MediaIoBaseDownload(fh, req)
+        downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
-            _, done = dl.next_chunk()
+            _, done = downloader.next_chunk()
+
     return dest
 
 
@@ -183,29 +198,11 @@ def _find_by_name(files: List[Dict], name: str) -> Optional[Dict]:
     return next((f for f in files if f["name"] == name), None)
 
 
-def find_first_match(files: List[Dict], contains: str, endswith: str) -> Optional[Dict]:
+def find_first_match(files: List[Dict], *, contains: str, endswith: str) -> Optional[Dict]:
     hits = [f for f in files if contains in f["name"] and f["name"].endswith(endswith)]
     hits.sort(key=lambda x: x["name"])
     return hits[0] if hits else None
 
-
-def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path:
-    """Download .set and matching .fdt into same stage folder."""
-    set_name = set_file["name"]
-    local_set = CACHE_ROOT / stage / set_name
-    _download(set_file["id"], local_set)
-
-    if set_name.lower().endswith(".set"):
-        fdt_name = set_name[:-4] + ".fdt"
-        fdt = _find_by_name(files, fdt_name)
-        if fdt:
-            _download(fdt["id"], CACHE_ROOT / stage / fdt_name)
-    return local_set
-
-
-# =========================
-# Participant discovery
-# =========================
 
 def participants_from_index(files: List[Dict]) -> List[str]:
     ids = set()
@@ -216,494 +213,481 @@ def participants_from_index(files: List[Dict]) -> List[str]:
     return sorted(ids)
 
 
-# =========================
-# Plot helpers
-# =========================
+def download_set_and_pair(files: List[Dict], set_file: Dict, stage: str) -> Path:
+    """
+    Download .set and (if present) matching .fdt into the same stage folder.
+    Returns local path to the .set file.
+    """
+    set_name = set_file["name"]
+    local_set = CACHE_ROOT / stage / set_name
+    _download(set_file["id"], local_set)
 
-def plot_segment_st(raw: mne.io.BaseRaw, title: str, channel: str = "Pz", duration: float = 5.0):
+    if set_name.lower().endswith(".set"):
+        fdt_name = set_name[:-4] + ".fdt"
+        fdt_file = _find_by_name(files, fdt_name)
+        if fdt_file:
+            local_fdt = CACHE_ROOT / stage / fdt_name
+            _download(fdt_file["id"], local_fdt)
+
+    return local_set
+
+
+def resolve_vo_root_folder_id(root_id: str) -> str:
+    """
+    If root_id is the parent (DataLiteracyProject), find child folder named
+    'Preprocessed_VisualOddball'. If root_id already points to that folder, return as-is.
+    """
+    svc = _drive_service()
+    meta = svc.files().get(fileId=root_id, fields="id,name,mimeType", supportsAllDrives=True).execute()
+    name = meta.get("name", "")
+    if name == "Preprocessed_VisualOddball":
+        return root_id
+
+    # Look for child folder
+    children = drive_list_children(root_id)
+    for c in children:
+        if c.get("mimeType") == "application/vnd.google-apps.folder" and c.get("name") == "Preprocessed_VisualOddball":
+            return c["id"]
+
+    # If not found, just return root_id (so error messages are meaningful later)
+    return root_id
+
+
+# ============================================================
+# 2) Pre-ICA helpers
+# ============================================================
+@st.cache_data(show_spinner=False)
+def load_preica_data_from_excel(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path)
+    df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
+    df["task"] = df["ID"].astype(str).str.extract(r"task-([^_]+)")
+    for c in df.columns:
+        if c not in ["ID", "participant", "task"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def get_preica_channels(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if c not in ["ID", "participant", "task"]]
+
+
+def plot_preica_line(df: pd.DataFrame, channels: List[str]) -> alt.Chart:
+    long_df = df.melt(id_vars=["participant"], value_vars=channels, var_name="channel", value_name="value")
+    return (
+        alt.Chart(long_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("channel:N", sort=channels, title="EEG channel"),
+            y=alt.Y("value:Q", title="Pre-ICA extreme loss"),
+            color=alt.Color("participant:N", title="Participant"),
+            tooltip=["participant", "channel", "value"],
+        )
+        .properties(height=420)
+        .interactive()
+    )
+
+
+def plot_preica_histograms(df: pd.DataFrame, channels: List[str]) -> None:
     apply_plot_style()
-    ch = channel if channel in raw.ch_names else raw.ch_names[0]
-    sfreq = float(raw.info["sfreq"])
-    n = int(sfreq * duration)
-    picks = [raw.ch_names.index(ch)]
-    data, times = raw[picks, :n]
+    n = len(channels)
+    ncols = 2
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes = np.ravel(axes) if isinstance(axes, np.ndarray) else [axes]
+    for i, ch in enumerate(channels):
+        ax = axes[i]
+        data = df[ch].dropna()
+        ax.hist(data, bins=20, color=TUE_PALETTE[i % len(TUE_PALETTE)], edgecolor="black")
+        ax.set_title(ch)
+        ax.set_xlabel("Pre-ICA extreme loss")
+        ax.set_ylabel("Count")
+        ax.set_ylim(bottom=0)
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def plot_preica_boxplot(df: pd.DataFrame, channels: List[str]) -> None:
+    apply_plot_style()
+    fig, ax = plt.subplots(figsize=(1 + 1.2 * len(channels), 5))
+    data = [df[ch].dropna() for ch in channels]
+    box = ax.boxplot(data, patch_artist=True, labels=channels)
+    for patch, color in zip(box["boxes"], TUE_PALETTE):
+        patch.set_facecolor(color)
+    ax.set_title("Distribution of selected channels")
+    ax.set_xlabel("EEG channel")
+    ax.set_ylabel("Pre-ICA extreme loss")
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ============================================================
+# 3) VO QC helpers (MNE)
+# ============================================================
+@st.cache_data(show_spinner=False)
+def load_raw_eeglab(path: str):
+    if mne is None:
+        return None
+    try:
+        return mne.io.read_raw_eeglab(path, preload=True, verbose="ERROR")
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def load_epochs_eeglab(path: str):
+    if mne is None:
+        return None
+    try:
+        return mne.io.read_epochs_eeglab(path, verbose="ERROR")
+    except Exception:
+        return None
+
+
+def plot_segment(raw_obj, title: str, channel: str = "Pz", duration: float = 5.0) -> None:
+    apply_plot_style()
+    picks = [raw_obj.ch_names.index(channel)] if channel in raw_obj.ch_names else [0]
+    ch_name = channel if channel in raw_obj.ch_names else raw_obj.ch_names[0]
+    sfreq = float(raw_obj.info["sfreq"])
+    data, times = raw_obj[picks, : int(sfreq * duration)]
     fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(times, data[0] * 1e6, lw=0.9)
-    ax.set_title(f"{title} ({ch})")
+    ax.plot(times, data[0] * 1e6, lw=0.9, color=TUE_PALETTE[0])
+    ax.set_title(f"{title} ({ch_name})")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Amplitude (µV)")
-    ax.axhline(0, lw=0.5, color="gray")
+    ax.axhline(0, color="gray", lw=0.5)
     st.pyplot(fig)
     plt.close(fig)
 
 
-def compute_psd_db(raw: mne.io.BaseRaw, channel: str, fmin: float, fmax: float) -> Tuple[np.ndarray, np.ndarray, str]:
-    ch = channel if channel in raw.ch_names else raw.ch_names[0]
-    spec = raw.compute_psd(fmin=fmin, fmax=fmax, picks=ch, verbose="ERROR")
-    freqs = spec.freqs
-    psd_db = 10 * np.log10(spec.get_data().squeeze())
-    return freqs, psd_db, ch
-
-
-def bandpower(freqs: np.ndarray, psd_db: np.ndarray, lo: float, hi: float) -> float:
-    mask = (freqs >= lo) & (freqs <= hi)
-    return float(np.nanmean(psd_db[mask])) if np.any(mask) else float("nan")
-
-
-# =========================
-# Your QC functions (Drive-backed)
-# =========================
-
-def find_any_set_local(files_index: List[Dict], folder: str, pattern_endswith: str, p_id: str) -> Optional[Path]:
-    """
-    Find a file by participant and suffix, download to cache and return local path.
-    pattern_endswith should be like 'raw.set', 'preprocessed.set', 'postICA.set', 'epoched.set', 'autoAR.set'
-    """
-    hit = find_first_match(files_index, contains=p_id, endswith=pattern_endswith)
-    if not hit:
-        return None
-    return download_set_and_pair(files_index, hit, folder)
-
-
-def qc_1_raw(files_index: List[Dict], p_id: str):
-    st.header("[1] Raw Continuous Dataset")
-    path = find_any_set_local(files_index, "01_raw", "raw.set", p_id)
-    if not path:
-        return st.warning("Raw file not found.")
-    raw = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
-    st.write(f"**File:** {path.name}")
-    st.info("Expected: Visible drifts, line noise, and large blinks.")
-    plot_segment_st(raw, "Raw EEG Segment", "Pz")
-
-
-def qc_2_preprocessed(files_index: List[Dict], p_id: str):
-    st.header("[2] Preprocessed Dataset")
-    path = find_any_set_local(files_index, "02_preprocessed", "preprocessed.set", p_id)
-    if not path:
-        return st.warning("Preprocessed file not found.")
-    preproc = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
-    st.write(f"**File:** {path.name}")
-    plot_segment_st(preproc, "Preprocessed Segment", "Pz")
-
-    fig = preproc.compute_psd(fmin=0.1, fmax=45.0, verbose="ERROR").plot(show=False)
-    st.pyplot(fig)
-    st.write("Expected: 1/f shape and alpha peak (8–12 Hz).")
-
-
-def qc_3_preICA_loss(files_index: List[Dict], p_id: str):
-    st.header("[3] Pre ICA Bad Channel Detection")
-    xlsx = _find_by_name(files_index, PREICA_XLSX_NAME)
-    if not xlsx:
-        return st.warning("Loss table not found on Drive.")
-    local = CACHE_ROOT / "03_preICA" / xlsx["name"]
-    _download(xlsx["id"], local)
-
-    df = pd.read_excel(local)
-    subj_data = df[df["ID"].astype(str).str.contains(p_id)]
-    if subj_data.empty:
-        return st.write("No loss data for this subject.")
-
-    ch_cols = [c for c in df.columns if c != "ID"]
-    values = subj_data[ch_cols].values.flatten().astype(float)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(range(len(ch_cols)), values)
-    ax.set_ylabel("% Extreme Artifact")
-    ax.set_title(f"Artifact Loss per Channel: {p_id}")
-    ax.set_xticks(range(len(ch_cols)))
-    ax.set_xticklabels(ch_cols, rotation=90, fontsize=7)
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-def qc_4_ICLabel(files_index: List[Dict], p_id: str):
-    st.header("[4] ICLabel Classification")
-    ic = find_first_match(files_index, contains=p_id, endswith=ICLABEL_SUFFIX)
-    if not ic:
-        return st.warning("ICLabel file not found for this participant.")
-    local = CACHE_ROOT / "05_ICLabel" / ic["name"]
-    _download(ic["id"], local)
-
-    df = pd.read_excel(local)
-    cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
-    if not set(cols).issubset(df.columns):
-        st.warning("ICLabel columns mismatch.")
-        st.write(list(df.columns))
-        return
-
-    mean_probs = df[cols].mean()
-    fig, ax = plt.subplots()
-    mean_probs.plot(kind="bar", ax=ax)
-    ax.set_ylabel("Mean probability (%)")
-    ax.set_title(f"ICLabel mean probs: {p_id}")
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-def qc_5_postICA(files_index: List[Dict], p_id: str):
-    st.header("[5] Post ICA & Corrected EOG")
-    path = find_any_set_local(files_index, "06_postICA", "postICA.set", p_id)
-    if not path:
-        return st.warning("Post ICA file not found.")
-    raw = mne.io.read_raw_eeglab(str(path), preload=True, verbose="ERROR")
-    for ch in ["CVEOGR", "CHEOG"]:
-        if ch in raw.ch_names:
-            st.write(f"**Channel:** {ch}")
-            plot_segment_st(raw, f"Corrected {ch}", ch)
-
-
-def qc_6_epoched(files_index: List[Dict], p_id: str):
-    st.header("[6] Epoched Data & ERP")
-    path = find_any_set_local(files_index, "08_AR", "autoAR.set", p_id) or find_any_set_local(files_index, "07_epoched", "epoched.set", p_id)
-    if not path:
-        return st.warning("Epoched file not found.")
-
-    epochs = mne.io.read_epochs_eeglab(str(path), verbose="ERROR")
-    keys = list(epochs.event_id.keys())
-    if not keys:
-        return st.warning("No events found in epochs.")
-
-    target_code = next((k for k in keys if "11" in str(k)), keys[0])
-    evoked = epochs[target_code].average()
-
-    fig = evoked.plot(picks="Pz", show=False) if "Pz" in evoked.ch_names else evoked.plot(show=False)
-    st.pyplot(fig)
-    st.write(f"ERP for condition: {target_code}. Expected: P3b deflection 300–500ms.")
-
-
-def qc_7_final_features(files_index: List[Dict]):
-    st.header("[7] Final P3b Feature Distribution")
-    csv = _find_by_name(files_index, FEATURES_CSV_NAME)
-    if not csv:
-        return st.warning("Feature CSV not found on Drive.")
-    local = CACHE_ROOT / csv["name"]
-    _download(csv["id"], local)
-
-    df = pd.read_csv(local)
-    col = "roi_mean_300_600" if "roi_mean_300_600" in df.columns else None
-    if not col:
-        st.warning("Column roi_mean_300_600 not found.")
-        st.write(list(df.columns))
-        return
-
-    fig, ax = plt.subplots()
-    df[col].hist(bins=30, ax=ax)
-    ax.set_title("P3b Mean Amplitude Distribution (All Trials)")
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-# =========================
-# Comparison lab (ALL participants)
-# =========================
-
-def compare_psd_overlay(files_index: List[Dict], participants: List[str], stage: str, channel: str, fmin: float, fmax: float):
-    pattern = PATTERNS.get(stage, "*preprocessed.set")
-    curves = []
-
-    for pid in participants:
-        path = find_any_set_local(files_index, stage, pattern.replace("*", ""), pid)
-        if not path:
-            continue
-        raw = mne.io.read_raw_eeglab(str(path), preload=False, verbose="ERROR")
-        freqs, psd_db, used_ch = compute_psd_db(raw, channel, fmin, fmax)
-        curves.append((pid, freqs, psd_db, used_ch))
-
-    if not curves:
-        st.warning("No PSD data found.")
-        return
-
+def plot_psd_overlay(raw_obj, preproc_obj, channel: str = "Pz") -> None:
     apply_plot_style()
-    fig, ax = plt.subplots(figsize=(10, 4))
-    for pid, freqs, psd_db, _ in curves:
-        ax.plot(freqs, psd_db, label=pid)
-    ax.set_title(f"PSD overlay ({stage}) @ {channel}")
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("PSD (dB)")
-    if len(curves) <= 10:
-        ax.legend()
-    st.pyplot(fig)
-    plt.close(fig)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    try:
+        spec_raw = raw_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
+        spec_pre = preproc_obj.compute_psd(fmin=0.5, fmax=45.0, picks=channel, verbose="ERROR")
+        freqs = spec_raw.freqs
+        psd_raw_db = 10 * np.log10(spec_raw.get_data().squeeze())
+        psd_pre_db = 10 * np.log10(spec_pre.get_data().squeeze())
+    except Exception:
+        from mne.time_frequency import psd_welch
 
-
-def compare_bandpower(files_index: List[Dict], participants: List[str], stage: str, channel: str):
-    pattern = PATTERNS.get(stage, "*preprocessed.set")
-    rows = []
-    for pid in participants:
-        path = find_any_set_local(files_index, stage, pattern.replace("*", ""), pid)
-        if not path:
-            rows.append({"participant": pid, "status": "missing"})
-            continue
-        raw = mne.io.read_raw_eeglab(str(path), preload=False, verbose="ERROR")
-        freqs, psd_db, used_ch = compute_psd_db(raw, channel, 0.5, 45.0)
-
-        row = {"participant": pid, "status": "ok", "channel_used": used_ch}
-        for name, (lo, hi) in {
-            "delta": (1, 4), "theta": (4, 8), "alpha": (8, 13), "beta": (13, 30), "gamma": (30, 45)
-        }.items():
-            row[name] = bandpower(freqs, psd_db, lo, hi)
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
-
-    ok = df[df["status"] == "ok"].set_index("participant")
-    if ok.empty:
-        return
-
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ok[["delta", "theta", "alpha", "beta", "gamma"]].plot(kind="bar", ax=ax)
-    ax.set_ylabel("Mean PSD (dB)")
-    ax.set_title(f"Bandpower comparison ({stage}) @ {channel}")
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-def compare_preica_heatmap(files_index: List[Dict], participants: List[str]):
-    xlsx = _find_by_name(files_index, PREICA_XLSX_NAME)
-    if not xlsx:
-        st.warning("PreICA loss excel not found.")
-        return
-    local = CACHE_ROOT / "03_preICA" / xlsx["name"]
-    _download(xlsx["id"], local)
-
-    df = pd.read_excel(local)
-    df["participant"] = df["ID"].astype(str).str.extract(r"^(sub-\d+)")
-    df = df[df["participant"].isin(participants)]
-    if df.empty:
-        st.warning("No rows for selected participants.")
-        return
-
-    ch_cols = [c for c in df.columns if c not in ["ID", "participant"]]
-    pivot = df.groupby("participant")[ch_cols].mean()
-    long = pivot.reset_index().melt(id_vars="participant", var_name="channel", value_name="loss")
-
-    heat = (
-        alt.Chart(long)
-        .mark_rect()
-        .encode(
-            x="channel:N",
-            y="participant:N",
-            color="loss:Q",
-            tooltip=["participant", "channel", alt.Tooltip("loss:Q", format=".3f")],
+        psd_raw, freqs = psd_welch(
+            raw_obj,
+            fmin=0.5,
+            fmax=45.0,
+            picks=[channel] if channel in raw_obj.ch_names else None,
+            verbose="ERROR",
         )
-        .properties(height=min(600, 28 * len(pivot.index)))
+        psd_pre, _ = psd_welch(
+            preproc_obj,
+            fmin=0.5,
+            fmax=45.0,
+            picks=[channel] if channel in preproc_obj.ch_names else None,
+            verbose="ERROR",
+        )
+        psd_raw_db = 10 * np.log10(psd_raw.squeeze())
+        psd_pre_db = 10 * np.log10(psd_pre.squeeze())
+
+    ax.plot(freqs, psd_raw_db, label="Raw", color=TUE_PALETTE[1])
+    ax.plot(freqs, psd_pre_db, label="Preprocessed", color=TUE_PALETTE[2])
+    ax.set_title(f"PSD overlay @ {channel}")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD (dB, V²/Hz)")
+    ax.legend()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ============================================================
+# 4) Views
+# ============================================================
+def preica_view(files_index: Optional[List[Dict]] = None) -> None:
+    st.header("Pre-ICA extreme-loss exploration")
+
+    excel_path: Optional[str] = None
+    if LOCAL_PREICA_XLSX.exists():
+        excel_path = str(LOCAL_PREICA_XLSX)
+        st.caption("Using local COCOA_preICAextremeloss.xlsx")
+    else:
+        if files_index is not None:
+            xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
+            if xlsx:
+                local = CACHE_ROOT / "preica" / xlsx["name"]
+                _download(xlsx["id"], local)
+                excel_path = str(local)
+                st.caption("Using Drive COCOA_preICAextremeloss.xlsx (cached)")
+    if excel_path is None:
+        st.error("Pre-ICA Excel not found (local or Drive).")
+        return
+
+    df = load_preica_data_from_excel(excel_path)
+    channels = get_preica_channels(df)
+    participants = sorted(df["participant"].dropna().unique().tolist())
+
+    st.sidebar.subheader("Pre-ICA controls")
+    selected_participants = st.sidebar.multiselect(
+        "Participants (optional)",
+        options=participants,
+        default=[],
+        placeholder="Leave empty = all participants",
+        key="preica_participants",
     )
-    st.altair_chart(heat, use_container_width=True)
+    default_channels = channels[:3] if channels else []
+    selected_channels = st.sidebar.multiselect(
+        "EEG channels",
+        options=channels,
+        default=default_channels,
+        key="preica_channels",
+    )
+    plot_type = st.sidebar.radio("Plot type", ["Line chart", "Histogram", "Boxplot"], key="preica_plot")
+    run = st.sidebar.button("Generate analysis", type="primary", key="preica_run")
 
-
-def compare_iclabel(files_index: List[Dict], participants: List[str]):
-    cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
-    rows = []
-    for pid in participants:
-        ic = find_first_match(files_index, contains=pid, endswith=ICLABEL_SUFFIX)
-        if not ic:
-            continue
-        local = CACHE_ROOT / "05_ICLabel" / ic["name"]
-        _download(ic["id"], local)
-        df = pd.read_excel(local)
-        if not set(cols).issubset(df.columns):
-            continue
-        means = df[cols].mean()
-        rows.append({"participant": pid, **{c: float(means[c]) for c in cols}})
-
-    if not rows:
-        st.warning("No ICLabel data for selected participants.")
+    if not run:
+        st.info("Select channels and click **Generate analysis**.")
+        return
+    if not selected_channels:
+        st.warning("Select at least one EEG channel.")
         return
 
-    out = pd.DataFrame(rows).set_index("participant")
-    st.dataframe(out, use_container_width=True)
+    active = selected_participants if selected_participants else participants
+    fdf = df[df["participant"].isin(active)].copy()
 
-    fig, ax = plt.subplots(figsize=(11, 4))
-    out.plot(kind="bar", stacked=True, ax=ax)
-    ax.set_ylabel("Mean probability (%)")
-    ax.set_title("ICLabel composition by participant")
-    st.pyplot(fig)
-    plt.close(fig)
+    st.subheader("Summary")
+    st.write(f"Participants used: {len(active)}")
+    st.write(f"Records: {len(fdf)}")
+
+    stats = []
+    for ch in selected_channels:
+        vals = fdf[ch].dropna()
+        stats.append(
+            {
+                "channel": ch,
+                "mean": float(vals.mean()) if len(vals) else np.nan,
+                "std": float(vals.std()) if len(vals) else np.nan,
+                "min": float(vals.min()) if len(vals) else np.nan,
+                "max": float(vals.max()) if len(vals) else np.nan,
+            }
+        )
+    st.dataframe(pd.DataFrame(stats), use_container_width=True)
+
+    st.subheader("Visualisation")
+    if plot_type == "Line chart":
+        st.altair_chart(plot_preica_line(fdf, selected_channels), use_container_width=True)
+    elif plot_type == "Histogram":
+        plot_preica_histograms(fdf, selected_channels)
+    else:
+        plot_preica_boxplot(fdf, selected_channels)
 
 
-def compare_features(files_index: List[Dict], participants: List[str]):
-    csv = _find_by_name(files_index, FEATURES_CSV_NAME)
-    if not csv:
-        st.warning("Features CSV not found.")
+def vo_qc_view(files_index: List[Dict]) -> None:
+    st.header("Visual Oddball QC (Google Drive)")
+
+    if mne is None:
+        st.error("MNE is not available. Add `mne` to requirements.txt.")
         return
-    local = CACHE_ROOT / csv["name"]
-    _download(csv["id"], local)
-    df = pd.read_csv(local)
 
-    pid_col = next((c for c in ["participant", "participant_id", "subject_id", "sub_id", "id"] if c in df.columns), None)
-    if not pid_col:
-        st.warning("No participant id column found in features CSV.")
-        st.write(list(df.columns))
+    participants = participants_from_index(files_index)
+    if not participants:
+        st.warning("No participant files found in this Drive folder.")
         return
 
-    df[pid_col] = df[pid_col].astype(str).str.strip()
-    df = df[df[pid_col].isin(participants)]
-    if df.empty:
-        st.warning("No feature rows for selected participants.")
+    st.sidebar.subheader("VO QC controls")
+    pid = st.sidebar.selectbox("Participant", participants, index=0, key="vo_pid")
+    run = st.sidebar.button("Run QC", type="primary", key="vo_run")
+
+    if not run:
+        st.info("Pick a participant and click **Run QC**.")
         return
 
-    feature_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    feature = st.selectbox("Feature", feature_cols, index=0)
+    st.markdown(f"### Participant: `{pid}`")
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    df.boxplot(column=feature, by=pid_col, ax=ax)
-    ax.set_title(f"{feature} by participant")
-    ax.set_ylabel(feature)
-    plt.suptitle("")
-    st.pyplot(fig)
-    plt.close(fig)
+    # Stage suffix patterns (your dataset naming)
+    stages: List[Tuple[str, str]] = [
+        ("01_raw", "_eeg_raw.set"),
+        ("02_preprocessed", "_eeg_preprocessed.set"),
+        ("03_preICA", "_eeg_preICA.set"),
+        ("04_ICAweighted", "_eegICA_weighted.set"),
+        ("06_postICA", "_eegpostICA.set"),
+        ("06_postICApracticeremoved", "_eegpostICA_practiceremoved.set"),
+        ("07_epoched", "_epoched.set"),
+    ]
 
-    summary = df.groupby(pid_col)[feature].agg(["count", "mean", "std", "min", "max"]).reset_index()
-    st.dataframe(summary, use_container_width=True)
+    # 1) Raw
+    st.subheader("1) Raw continuous data")
+    raw_set = find_first_match(files_index, contains=pid, endswith=stages[0][1])
+    raw_obj = None
+    if raw_set:
+        raw_path = download_set_and_pair(files_index, raw_set, "01_raw")
+        raw_obj = load_raw_eeglab(str(raw_path))
+        if raw_obj is not None:
+            plot_segment(raw_obj, "Raw EEG segment", "Pz", 5.0)
+        else:
+            st.error("Failed to load raw .set (downloaded).")
+    else:
+        st.warning("Raw .set not found for this participant.")
+
+    # 2) Preprocessed + PSD overlay
+    st.subheader("2) Preprocessed data and PSD overlay")
+    pre_set = find_first_match(files_index, contains=pid, endswith=stages[1][1])
+    if pre_set:
+        pre_path = download_set_and_pair(files_index, pre_set, "02_preprocessed")
+        pre_obj = load_raw_eeglab(str(pre_path))
+        if pre_obj is not None:
+            plot_segment(pre_obj, "Preprocessed segment", "Pz", 5.0)
+            if raw_obj is not None:
+                plot_psd_overlay(raw_obj, pre_obj, "Pz")
+        else:
+            st.error("Failed to load preprocessed .set (downloaded).")
+    else:
+        st.warning("Preprocessed .set not found for this participant.")
+
+    # 3) Pre-ICA extreme-loss Excel (optional)
+    st.subheader("3) Pre-ICA extreme-loss table (optional)")
+    preica_xlsx = _find_by_name(files_index, "COCOA_preICAextremeloss.xlsx")
+    if preica_xlsx:
+        local_xlsx = CACHE_ROOT / "03_preICA" / preica_xlsx["name"]
+        _download(preica_xlsx["id"], local_xlsx)
+        df_loss = pd.read_excel(local_xlsx)
+        if "ID" in df_loss.columns:
+            subj = df_loss[df_loss["ID"].astype(str).str.contains(pid)]
+            if not subj.empty:
+                ch_cols = [c for c in subj.columns if c not in ["ID"]]
+                vals = subj[ch_cols].values.flatten().astype(float)
+                apply_plot_style()
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.bar(range(len(ch_cols)), vals, color=TUE_PALETTE[3])
+                ax.set_xticks(range(len(ch_cols)))
+                ax.set_xticklabels(ch_cols, rotation=90)
+                ax.set_ylabel("% extreme artifact")
+                ax.set_title("Pre-ICA extreme-loss per channel (from table)")
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.info("No loss data for this participant in the Excel table.")
+        else:
+            st.warning("Excel table found but missing 'ID' column.")
+    else:
+        st.info("COCOA_preICAextremeloss.xlsx not found in this Drive folder.")
+
+    # 4) ICLabel xlsx (optional)
+    st.subheader("4) ICLabel classification (optional)")
+    ic_xlsx = find_first_match(files_index, contains=pid, endswith="_ICclassifications.xlsx")
+    if ic_xlsx:
+        local_ic = CACHE_ROOT / "05_ICLabel" / ic_xlsx["name"]
+        _download(ic_xlsx["id"], local_ic)
+        ic_df = pd.read_excel(local_ic)
+
+        cols = ["Brain", "Muscle", "Eye", "Heart", "Line_Noise", "Channel_Noise", "Other"]
+        if set(cols).issubset(ic_df.columns):
+            apply_plot_style()
+            mean_probs = ic_df[cols].mean()
+            fig, ax = plt.subplots()
+            mean_probs.plot(
+                kind="bar",
+                ax=ax,
+                color=[TUE_PALETTE[i % len(TUE_PALETTE)] for i in range(len(cols))],
+            )
+            ax.set_ylabel("Mean probability (%)")
+            ax.set_title("Mean ICLabel class probabilities")
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.warning("ICLabel file found but required columns are missing.")
+            st.write("Columns:", list(ic_df.columns))
+    else:
+        st.info("ICLabel xlsx not found for this participant.")
+
+    # 5) Epoched / AutoAR (optional)
+    st.subheader("5) Epoched data & ERP (optional)")
+    ar_hits = [f for f in files_index if pid in f["name"] and "autoAR" in f["name"] and f["name"].endswith(".set")]
+    ar_hits.sort(key=lambda x: x["name"])
+    ar_set = ar_hits[0] if ar_hits else None
+
+    ep_set = find_first_match(files_index, contains=pid, endswith="_epoched.set")
+    chosen = ar_set or ep_set
+    stage = "08_AR" if ar_set else "07_epoched"
+
+    if chosen:
+        ep_path = download_set_and_pair(files_index, chosen, stage)
+        epochs = load_epochs_eeglab(str(ep_path))
+        if epochs is not None:
+            keys = list(epochs.event_id.keys())
+            target = keys[0] if keys else None
+            if target:
+                try:
+                    evk = epochs[target].average()
+                    fig = evk.plot(picks="Pz" if "Pz" in evk.ch_names else None, show=False)
+                    st.pyplot(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    st.error(f"Could not plot ERP: {e}")
+            else:
+                st.warning("No events found in epochs.")
+        else:
+            st.error("Failed to load epochs .set (downloaded).")
+    else:
+        st.info("No epoched/autoAR .set found for this participant.")
 
 
-# =========================
-# Overview
-# =========================
-
-def cache_size_mb() -> float:
-    total = 0
-    for p in CACHE_ROOT.rglob("*"):
-        if p.is_file():
-            total += p.stat().st_size
-    return total / (1024 * 1024)
-
-
-def overview(files_index: List[Dict], root_meta: Dict):
-    st.header("Overview")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Drive folder", root_meta.get("name", ""))
-    col2.metric("Indexed files", f"{len(files_index):,}")
-    col3.metric("Participants", f"{len(participants_from_index(files_index)):,}")
-    col4.metric("Cache (MB)", f"{cache_size_mb():.1f}")
-
-    # file type distribution
-    ext_counts = {}
-    for f in files_index:
-        name = f["name"]
-        ext = name.split(".")[-1].lower() if "." in name else "(none)"
-        ext_counts[ext] = ext_counts.get(ext, 0) + 1
-
-    df = pd.DataFrame([{"ext": k, "count": v} for k, v in sorted(ext_counts.items(), key=lambda x: -x[1])]).head(12)
-    chart = alt.Chart(df).mark_bar().encode(x="count:Q", y=alt.Y("ext:N", sort="-x")).properties(height=320)
-    st.altair_chart(chart, use_container_width=True)
-
-    st.caption("This app runs the full MNE QC pipeline on Drive-backed EEG data (cached in /tmp).")
-
-
-# =========================
-# Tools
-# =========================
-
-def sidebar_tools():
+# ============================================================
+# 5) Sidebar tools
+# ============================================================
+def sidebar_tools() -> None:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Tools")
-    if st.sidebar.button("Clear cache (/tmp)"):
-        shutil.rmtree(CACHE_ROOT, ignore_errors=True)
-        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        st.sidebar.success("Cache cleared.")
-    if st.sidebar.button("Reindex Drive"):
+
+    if st.sidebar.button("Clear local cache (/tmp)", help="Deletes downloaded files under /tmp/cocoa_cache"):
+        try:
+            shutil.rmtree(CACHE_ROOT, ignore_errors=True)
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            st.sidebar.success("Cache cleared.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to clear cache: {e}")
+
+    if st.sidebar.button("Reindex Drive", help="Clears cached Drive index and refetches"):
         drive_index_recursive.clear()
         drive_list_children.clear()
-        st.sidebar.success("Drive cache cleared. Reload to reindex.")
+        st.sidebar.success("Drive index cache cleared. Reload to refetch.")
 
 
-# =========================
-# Main
-# =========================
+# ============================================================
+# 6) Main
+# ============================================================
+def main() -> None:
+    st.set_page_config(layout="wide", page_title="COCOA Dashboard")
+    st.title("COCOA EEG Analysis Dashboard")
 
-def main():
-    st.set_page_config(layout="wide", page_title="COCOA QC Suite")
-    st.title("COCOA QC Suite")
+    root_folder_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
 
-    root_id = st.secrets["GDRIVE_VO_FOLDER_ID"]
-    root_meta = drive_smoke(root_id)
+    # Verify Drive access to the configured root
+    drive_smoke_test(root_folder_id)
 
-    vo_id = resolve_vo_folder_id(root_id)
-    if vo_id != root_id:
-        st.caption("Auto-detected: using **Preprocessed_VisualOddball** inside the parent folder.")
+    # Resolve VO folder (in case user pointed at parent folder)
+    vo_folder_id = resolve_vo_root_folder_id(root_folder_id)
 
-    files_index = drive_index_recursive(vo_id)
-    p_all = participants_from_index(files_index)
+    # If we failed to locate the VO folder, warn clearly
+    if vo_folder_id == root_folder_id:
+        # It might already be the correct folder OR it might be parent and missing VO folder
+        # We can detect by listing children
+        children = drive_list_children(root_folder_id)
+        child_names = {c.get("name") for c in children}
+        if "Preprocessed_VisualOddball" in child_names:
+            vo_folder_id = next(c["id"] for c in children if c.get("name") == "Preprocessed_VisualOddball")
+
+    # Index under VO folder for QC view, and (optionally) for pulling Excel
+    files_index = drive_index_recursive(vo_folder_id)
 
     sidebar_tools()
 
-    nav = st.sidebar.radio("Navigation", ["Overview", "QC Single", "QC Full", "Comparison Lab"], index=0)
+    view = st.sidebar.selectbox("Select view", ["Pre-ICA Metrics", "Visual Oddball QC"], key="main_view")
 
-    if nav == "Overview":
-        overview(files_index, root_meta)
-        return
-
-    if not p_all:
-        st.error("No participants found in index.")
-        return
-
-    if nav in ["QC Single", "QC Full"]:
-        pid = st.sidebar.selectbox("Participant", p_all, index=0)
-
-        if nav == "QC Single":
-            step = st.sidebar.selectbox(
-                "Step",
-                ["[1] Raw", "[2] Preprocessed", "[3] PreICA Loss", "[4] ICLabel", "[5] PostICA", "[6] Epoched", "[7] Features"],
-                index=1,
-            )
-            if step == "[1] Raw":
-                qc_1_raw(files_index, pid)
-            elif step == "[2] Preprocessed":
-                qc_2_preprocessed(files_index, pid)
-            elif step == "[3] PreICA Loss":
-                qc_3_preICA_loss(files_index, pid)
-            elif step == "[4] ICLabel":
-                qc_4_ICLabel(files_index, pid)
-            elif step == "[5] PostICA":
-                qc_5_postICA(files_index, pid)
-            elif step == "[6] Epoched":
-                qc_6_epoched(files_index, pid)
-            else:
-                qc_7_final_features(files_index)
-
-        else:
-            st.sidebar.info("Runs all steps in order.")
-            qc_1_raw(files_index, pid)
-            qc_2_preprocessed(files_index, pid)
-            qc_3_preICA_loss(files_index, pid)
-            qc_4_ICLabel(files_index, pid)
-            qc_5_postICA(files_index, pid)
-            qc_6_epoched(files_index, pid)
-            qc_7_final_features(files_index)
-
-        return
-
-    # Comparison Lab
-    st.header("Comparison Lab (Multi-participant)")
-    chosen = st.sidebar.multiselect("Participants", p_all, default=p_all[:6])
-    if len(chosen) < 2:
-        st.info("Select at least 2 participants.")
-        return
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["PSD Overlay", "Bandpower", "PreICA Heatmap", "ICLabel", "P3b Features"])
-
-    with tab1:
-        stage = st.selectbox("Stage", ["01_raw", "02_preprocessed", "06_postICA"], index=1)
-        channel = st.selectbox("Channel", ["Pz", "Cz", "Fz", "Oz"], index=0)
-        fmin, fmax = st.slider("PSD range (Hz)", 0.1, 60.0, (0.5, 45.0), 0.1)
-        compare_psd_overlay(files_index, chosen, stage, channel, fmin, fmax)
-
-    with tab2:
-        stage = st.selectbox("Stage for bandpower", ["01_raw", "02_preprocessed"], index=1)
-        channel = st.selectbox("Channel for bandpower", ["Pz", "Cz", "Fz", "Oz"], index=0)
-        compare_bandpower(files_index, chosen, stage, channel)
-
-    with tab3:
-        compare_preica_heatmap(files_index, chosen)
-
-    with tab4:
-        compare_iclabel(files_index, chosen)
-
-    with tab5:
-        compare_features(files_index, chosen)
+    if view == "Pre-ICA Metrics":
+        preica_view(files_index=files_index)
+    else:
+        vo_qc_view(files_index=files_index)
 
 
 if __name__ == "__main__":
